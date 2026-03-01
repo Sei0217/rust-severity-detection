@@ -153,71 +153,110 @@ def main():
         
         time.sleep(2)
         
-        fps_start_time = time.time()
-        fps_frame_count = 0
-        fps = 0
-        
+        boxes, scores, class_ids = [], [], []
+        inference_time = 0
+        last_result_frame = None
+
         print("\n=== DETECTION STARTED ===")
-        print("Press 'q' to quit")
-        print("Press 's' to manually save frame\n")
-        
+        print("Press 'q'     - quit")
+        print("Press SPACE   - capture & detect")
+        print("Press 's'     - save current frame\n")
+
         while True:
-            # Capture RGB frame
+            # Always grab a live frame for the preview
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            img_height, img_width = frame_rgb.shape[:2]
-            
-            # Preprocess
-            input_image, scale, pad_top, pad_left = preprocess_image(frame_rgb, INPUT_SIZE)
-            
-            # Inference
-            inference_start = time.time()
-            outputs = session.run(None, {input_name: input_image})
-            inference_time = time.time() - inference_start
-            
-            # Post-process
-            boxes, scores, class_ids = postprocess_detections(
-                outputs, img_width, img_height, scale, pad_top, pad_left, CONFIDENCE_THRESHOLD
-            )
-            
-            # Draw
+
+            # if not manual_mode:
+            #     # --- AUTO MODE: run inference on every frame ---
+            #     input_image, scale, pad_top, pad_left = preprocess_image(frame_rgb, INPUT_SIZE)
+            #
+            #     inference_start = time.time()
+            #     outputs = session.run(None, {input_name: input_image})
+            #     inference_time = time.time() - inference_start
+            #
+            #     boxes, scores, class_ids = postprocess_detections(
+            #         outputs, img_width, img_height, scale, pad_top, pad_left, CONFIDENCE_THRESHOLD
+            #     )
+            #
+            #     display_frame = frame_bgr.copy()
+            #     if len(boxes) > 0:
+            #         display_frame = draw_detections(display_frame, boxes, scores, class_ids)
+            #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            #         save_path = os.path.join(DETECTIONS_FOLDER, f"corrosion_{timestamp}.jpg")
+            #         cv2.imwrite(save_path, display_frame)
+            #         print(f"✓ Auto-saved: {save_path}")
+            #
+            #     # FPS counter (auto mode only)
+            #     fps_frame_count += 1
+            #     if time.time() - fps_start_time >= 1.0:
+            #         fps = fps_frame_count
+            #         fps_frame_count = 0
+            #         fps_start_time = time.time()
+            #
+            #     cv2.putText(display_frame, f"FPS: {fps}", (10, 30),
+            #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #     cv2.putText(display_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60),
+            #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #     cv2.putText(display_frame, f"Detections: {len(boxes)}", (10, 90),
+            #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #     cv2.putText(display_frame, "MODE: AUTO", (10, 120),
+            #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            #
+            # --- MANUAL MODE: show live preview, overlay last result ---
             display_frame = frame_bgr.copy()
-            if len(boxes) > 0:
-                display_frame = draw_detections(display_frame, boxes, scores, class_ids)
-                
-                # Auto-save
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = os.path.join(DETECTIONS_FOLDER, f"corrosion_{timestamp}.jpg")
-                cv2.imwrite(save_path, display_frame)
-                print(f"✓ Saved: {save_path}")
-            
-            # Calculate FPS
-            fps_frame_count += 1
-            if time.time() - fps_start_time >= 1.0:
-                fps = fps_frame_count
-                fps_frame_count = 0
-                fps_start_time = time.time()
-            
-            # Display overlays
-            cv2.putText(display_frame, f"FPS: {fps}", (10, 30), 
+            if last_result_frame is not None:
+                # Blend last detection overlay onto current live view
+                display_frame = last_result_frame.copy()
+
+            cv2.putText(display_frame, f"Detections: {len(boxes)}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60), 
+            cv2.putText(display_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_frame, f"Detections: {len(boxes)}", (10, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
+            cv2.putText(display_frame, "MODE: MANUAL  [SPACE] to capture", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
+
             cv2.imshow("RustWatch - Corrosion Detection", display_frame)
-            
+
             # Handle keys
             key = cv2.waitKey(1) & 0xFF
+
             if key == ord('q'):
                 print("\nQuitting...")
                 break
+
+            elif key == ord(' '):
+                # Manual capture: grab a fresh frame and run inference
+                print("Capturing...")
+                capture_rgb = picam2.capture_array()
+                capture_bgr = cv2.cvtColor(capture_rgb, cv2.COLOR_RGB2BGR)
+                cap_height, cap_width = capture_rgb.shape[:2]
+
+                input_image, scale, pad_top, pad_left = preprocess_image(capture_rgb, INPUT_SIZE)
+
+                inference_start = time.time()
+                outputs = session.run(None, {input_name: input_image})
+                inference_time = time.time() - inference_start
+
+                boxes, scores, class_ids = postprocess_detections(
+                    outputs, cap_width, cap_height, scale, pad_top, pad_left, CONFIDENCE_THRESHOLD
+                )
+
+                last_result_frame = capture_bgr.copy()
+                if len(boxes) > 0:
+                    last_result_frame = draw_detections(last_result_frame, boxes, scores, class_ids)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    save_path = os.path.join(DETECTIONS_FOLDER, f"corrosion_{timestamp}.jpg")
+                    cv2.imwrite(save_path, last_result_frame)
+                    print(f"✓ Corrosion detected & saved: {save_path}")
+                else:
+                    print("No corrosion detected in capture")
+
             elif key == ord('s'):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 save_path = os.path.join(DETECTIONS_FOLDER, f"manual_{timestamp}.jpg")
                 cv2.imwrite(save_path, display_frame)
-                print(f"✓ Manual save: {save_path}")
+                print(f"✓ Saved: {save_path}")
     
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
