@@ -263,8 +263,8 @@ def main():
         last_result_frame = None
         fps, fps_counter, fps_timer = 0, 0, time.time()
 
-        # Scan for available models in the same folder as MODEL_PATH
-        model_dir = os.path.dirname(MODEL_PATH) or "."
+        # Scan for available models in the models folder
+        model_dir = os.path.join(os.path.dirname(MODEL_PATH), "..")
         model_paths = sorted([
             os.path.join(model_dir, f)
             for f in os.listdir(model_dir) if f.endswith(".onnx")
