@@ -23,6 +23,7 @@ SETTING_LABELS = [
     ("show_inference_time", "Show Inference Time"),
     ("show_detection_count", "Show Detection Count"),
     ("show_fps", "Show FPS"),
+    ("show_model", "Show Model Name"),
     ("auto_save", "Auto-Save (skip review)"),
 ]
 
@@ -311,6 +312,7 @@ def main():
                 "show_inference_time": True,
                 "show_detection_count": True,
                 "show_fps": False,
+                "show_model": False,
                 "auto_save": False,
                 "threshold": CONFIDENCE_THRESHOLD,
             },
@@ -364,6 +366,13 @@ def main():
                 if ui["settings"]["show_fps"]:
                     cv2.putText(display_frame, f"FPS: {fps}", (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            if ui["settings"]["show_model"]:
+                hf = display_frame.shape[0]
+                model_label = os.path.splitext(os.path.basename(ui["model_paths"][ui["model_idx"]]))[0]
+                label_y = hf - 55 if reviewing else hf - 10
+                cv2.putText(display_frame, f"Model: {model_label}", (10, label_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
             draw_settings_ui(display_frame, ui)
 
