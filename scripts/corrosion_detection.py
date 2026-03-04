@@ -18,6 +18,86 @@ os.makedirs(DETECTIONS_FOLDER, exist_ok=True)
 # Class names
 CLASS_NAMES = ["corrosion"]
 
+# Settings panel definition: (settings_key, display_label)
+SETTING_LABELS = [
+    ("show_inference_time", "Show Inference Time"),
+    ("show_detection_count", "Show Detection Count"),
+    ("auto_save", "Auto-Save (skip review)"),
+]
+
+def on_mouse(event, x, y, _flags, ui):
+    """Handle mouse clicks for settings button and panel."""
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    rects = ui["rects"]
+
+    # Settings button click → toggle panel
+    if "settings_btn" in rects:
+        bx1, by1, bx2, by2 = rects["settings_btn"]
+        if bx1 <= x <= bx2 and by1 <= y <= by2:
+            ui["show_settings"] = not ui["show_settings"]
+            return
+
+    # Option row click → toggle setting
+    if ui["show_settings"]:
+        for key, rect in rects.items():
+            if key.startswith("opt_"):
+                rx1, ry1, rx2, ry2 = rect
+                if rx1 <= x <= rx2 and ry1 <= y <= ry2:
+                    setting_key = key[4:]
+                    ui["settings"][setting_key] = not ui["settings"][setting_key]
+                    return
+        # Click outside the panel → close it
+        if "panel" in rects:
+            px1, py1, px2, py2 = rects["panel"]
+            if not (px1 <= x <= px2 and py1 <= y <= py2):
+                ui["show_settings"] = False
+
+def draw_settings_ui(frame, ui):
+    """Draw the settings button (and panel if open). Updates ui['rects']."""
+    w = frame.shape[1]
+    rects = {}
+
+    # Settings button — top-right corner
+    btn_x1, btn_y1 = w - 115, 5
+    btn_x2, btn_y2 = w - 5, 32
+    cv2.rectangle(frame, (btn_x1, btn_y1), (btn_x2, btn_y2), (50, 50, 50), -1)
+    cv2.rectangle(frame, (btn_x1, btn_y1), (btn_x2, btn_y2), (160, 160, 160), 1)
+    cv2.putText(frame, "* Settings", (btn_x1 + 5, btn_y2 - 8),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+    rects["settings_btn"] = (btn_x1, btn_y1, btn_x2, btn_y2)
+
+    if ui["show_settings"]:
+        row_h = 34
+        panel_w = 240
+        panel_h = 15 + len(SETTING_LABELS) * row_h + 8
+        panel_x = w - panel_w - 5
+        panel_y = btn_y2 + 4
+
+        # Semi-transparent dark background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h), (25, 25, 25), -1)
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(frame, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h), (130, 130, 130), 1)
+        rects["panel"] = (panel_x, panel_y, panel_x + panel_w, panel_y + panel_h)
+
+        for i, (key, label) in enumerate(SETTING_LABELS):
+            ry = panel_y + 10 + i * row_h
+            rx1, ry1 = panel_x + 8, ry
+            rx2, ry2 = panel_x + panel_w - 8, ry + row_h - 5
+            enabled = ui["settings"][key]
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2),
+                         (0, 110, 0) if enabled else (55, 55, 55), -1)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (140, 140, 140), 1)
+            status = "ON" if enabled else "OFF"
+            cv2.putText(frame, f"{label}  [{status}]", (rx1 + 6, ry1 + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+            rects[f"opt_{key}"] = (rx1, ry1, rx2, ry2)
+
+    ui["rects"] = rects
+
 def preprocess_image(image, input_size):
     """Preprocess image for YOLO input"""
     # Convert RGBA to RGB if needed
@@ -157,6 +237,18 @@ def main():
         boxes, scores, class_ids = [], [], []
         inference_time = 0
         last_result_frame = None
+        ui = {
+            "show_settings": False,
+            "settings": {
+                "show_inference_time": True,
+                "show_detection_count": True,
+                "auto_save": False,
+            },
+            "rects": {}
+        }
+
+        cv2.namedWindow("RustWatch - Corrosion Detection")
+        cv2.setMouseCallback("RustWatch - Corrosion Detection", on_mouse, ui)
 
         print("\n=== DETECTION STARTED ===")
         print("Press 'q'         - quit")
@@ -177,13 +269,20 @@ def main():
                 cv2.rectangle(display_frame, (0, h - 50), (w, h), (0, 0, 0), -1)
                 cv2.putText(display_frame, "[s] Save   [r] Retake   [q] Quit",
                            (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.putText(display_frame, f"REVIEW  |  Detections: {len(boxes)}  |  Inference: {inference_time*1000:.1f}ms",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                hud = "REVIEW"
+                if ui["settings"]["show_detection_count"]:
+                    hud += f"  |  Detections: {len(boxes)}"
+                if ui["settings"]["show_inference_time"]:
+                    hud += f"  |  Inference: {inference_time*1000:.1f}ms"
+                cv2.putText(display_frame, hud, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             else:
                 # --- LIVE PREVIEW STATE ---
                 display_frame = frame_bgr.copy()
                 cv2.putText(display_frame, "LIVE  |  [SPACE] Capture", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
+
+            draw_settings_ui(display_frame, ui)
 
             # if not manual_mode:
             #     # --- AUTO MODE: run inference on every frame ---
@@ -249,11 +348,19 @@ def main():
                 last_result_frame = capture_bgr.copy()
                 if len(boxes) > 0:
                     last_result_frame = draw_detections(last_result_frame, boxes, scores, class_ids)
-                    print(f"✓ {len(boxes)} detection(s) found — press [s] to save or [r] to retake")
-                else:
-                    print("No corrosion detected — press [s] to save anyway or [r] to retake")
 
-                reviewing = True
+                if ui["settings"]["auto_save"] and len(boxes) > 0:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    save_path = os.path.join(DETECTIONS_FOLDER, f"corrosion_{timestamp}.jpg")
+                    cv2.imwrite(save_path, last_result_frame)
+                    print(f"✓ Auto-saved: {save_path}")
+                    boxes, scores, class_ids = [], [], []
+                else:
+                    if len(boxes) > 0:
+                        print(f"✓ {len(boxes)} detection(s) found — press [s] to save or [r] to retake")
+                    else:
+                        print("No corrosion detected — press [s] to save anyway or [r] to retake")
+                    reviewing = True
 
             elif key == ord('s') and reviewing:
                 # Save captured frame and return to live preview
