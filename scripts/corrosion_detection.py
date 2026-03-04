@@ -7,7 +7,7 @@ from datetime import datetime
 import os
 
 # Configuration
-MODEL_PATH = "../models/yolov8n_static_int8.onnx"
+MODEL_PATH = "../models/yolov8n.onnx"
 DETECTIONS_FOLDER = "../detections"
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
