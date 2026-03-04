@@ -262,8 +262,12 @@ def draw_detections(image, boxes, scores, class_ids):
         # Label
         label = f"{CLASS_NAMES[class_id]}: {score:.2f}"
         (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image, (x1, y1 - label_h - 5), (x1 + label_w, y1), (0, 0, 255), -1)
-        cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        if y1 - label_h - 5 >= 0:
+            cv2.rectangle(image, (x1, y1 - label_h - 5), (x1 + label_w, y1), (0, 0, 255), -1)
+            cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        else:
+            cv2.rectangle(image, (x1, y1), (x1 + label_w, y1 + label_h + 5), (0, 0, 255), -1)
+            cv2.putText(image, label, (x1, y1 + label_h + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     return image
 
 def main():
