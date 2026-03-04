@@ -7,7 +7,7 @@ from datetime import datetime
 import os
 
 # Configuration
-MODEL_PATH = "../models/yolov8n.onnx"
+MODEL_PATH = "../models/development/yolov8n_static_int8.onnx"
 DETECTIONS_FOLDER = "../detections"
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
@@ -153,19 +153,37 @@ def main():
         
         time.sleep(2)
         
+        reviewing = False
         boxes, scores, class_ids = [], [], []
         inference_time = 0
         last_result_frame = None
 
         print("\n=== DETECTION STARTED ===")
-        print("Press 'q'     - quit")
-        print("Press SPACE   - capture & detect")
-        print("Press 's'     - save current frame\n")
+        print("Press 'q'         - quit")
+        print("Press SPACE       - capture & detect")
+        print("After capture:")
+        print("  Press 's'       - save and return to preview")
+        print("  Press 'r'       - retake (back to live preview)\n")
 
         while True:
-            # Always grab a live frame for the preview
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            if reviewing:
+                # --- REVIEW STATE: show frozen capture with detection results ---
+                display_frame = last_result_frame.copy()
+                h, w = display_frame.shape[:2]
+                # Bottom banner
+                cv2.rectangle(display_frame, (0, h - 50), (w, h), (0, 0, 0), -1)
+                cv2.putText(display_frame, "[s] Save   [r] Retake   [q] Quit",
+                           (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(display_frame, f"REVIEW  |  Detections: {len(boxes)}  |  Inference: {inference_time*1000:.1f}ms",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                # --- LIVE PREVIEW STATE ---
+                display_frame = frame_bgr.copy()
+                cv2.putText(display_frame, "LIVE  |  [SPACE] Capture", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
 
             # if not manual_mode:
             #     # --- AUTO MODE: run inference on every frame ---
@@ -202,31 +220,17 @@ def main():
             #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             #     cv2.putText(display_frame, "MODE: AUTO", (10, 120),
             #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-            #
-            # --- MANUAL MODE: show live preview, overlay last result ---
-            display_frame = frame_bgr.copy()
-            if last_result_frame is not None:
-                # Blend last detection overlay onto current live view
-                display_frame = last_result_frame.copy()
-
-            cv2.putText(display_frame, f"Detections: {len(boxes)}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_frame, "MODE: MANUAL  [SPACE] to capture", (10, 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
 
             cv2.imshow("RustWatch - Corrosion Detection", display_frame)
 
-            # Handle keys
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord('q'):
                 print("\nQuitting...")
                 break
 
-            elif key == ord(' '):
-                # Manual capture: grab a fresh frame and run inference
+            elif key == ord(' ') and not reviewing:
+                # Capture & run inference, then enter review state
                 print("Capturing...")
                 capture_rgb = picam2.capture_array()
                 capture_bgr = cv2.cvtColor(capture_rgb, cv2.COLOR_RGB2BGR)
@@ -245,18 +249,27 @@ def main():
                 last_result_frame = capture_bgr.copy()
                 if len(boxes) > 0:
                     last_result_frame = draw_detections(last_result_frame, boxes, scores, class_ids)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    save_path = os.path.join(DETECTIONS_FOLDER, f"corrosion_{timestamp}.jpg")
-                    cv2.imwrite(save_path, last_result_frame)
-                    print(f"✓ Corrosion detected & saved: {save_path}")
+                    print(f"✓ {len(boxes)} detection(s) found — press [s] to save or [r] to retake")
                 else:
-                    print("No corrosion detected in capture")
+                    print("No corrosion detected — press [s] to save anyway or [r] to retake")
 
-            elif key == ord('s'):
+                reviewing = True
+
+            elif key == ord('s') and reviewing:
+                # Save captured frame and return to live preview
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = os.path.join(DETECTIONS_FOLDER, f"manual_{timestamp}.jpg")
-                cv2.imwrite(save_path, display_frame)
+                prefix = "corrosion" if len(boxes) > 0 else "capture"
+                save_path = os.path.join(DETECTIONS_FOLDER, f"{prefix}_{timestamp}.jpg")
+                cv2.imwrite(save_path, last_result_frame)
                 print(f"✓ Saved: {save_path}")
+                reviewing = False
+                boxes, scores, class_ids = [], [], []
+
+            elif key == ord('r') and reviewing:
+                # Discard capture and return to live preview
+                print("Retaking — back to live preview")
+                reviewing = False
+                boxes, scores, class_ids = [], [], []
     
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
