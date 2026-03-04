@@ -48,6 +48,17 @@ def on_mouse(event, x, y, _flags, ui):
                     setting_key = key[4:]
                     ui["settings"][setting_key] = not ui["settings"][setting_key]
                     return
+        # Threshold +/- buttons
+        if "threshold_minus" in rects:
+            tx1, ty1, tx2, ty2 = rects["threshold_minus"]
+            if tx1 <= x <= tx2 and ty1 <= y <= ty2:
+                ui["settings"]["threshold"] = round(max(0.05, ui["settings"]["threshold"] - 0.05), 2)
+                return
+        if "threshold_plus" in rects:
+            tx1, ty1, tx2, ty2 = rects["threshold_plus"]
+            if tx1 <= x <= tx2 and ty1 <= y <= ty2:
+                ui["settings"]["threshold"] = round(min(0.99, ui["settings"]["threshold"] + 0.05), 2)
+                return
         # Model row click → cycle to next model
         if "model_row" in rects:
             mrx1, mry1, mrx2, mry2 = rects["model_row"]
@@ -78,7 +89,7 @@ def draw_settings_ui(frame, ui):
     if ui["show_settings"]:
         row_h = 34
         panel_w = 260
-        panel_h = 15 + len(SETTING_LABELS) * row_h + 12 + row_h + 8
+        panel_h = 15 + len(SETTING_LABELS) * row_h + 12 + row_h + row_h + 8
         panel_x = w - panel_w - 5
         panel_y = btn_y2 + 4
 
@@ -109,9 +120,29 @@ def draw_settings_ui(frame, ui):
         sep_y = panel_y + 10 + len(SETTING_LABELS) * row_h + 4
         cv2.line(frame, (panel_x + 8, sep_y), (panel_x + panel_w - 8, sep_y), (100, 100, 100), 1)
 
+        # Threshold row
+        thr = ui["settings"]["threshold"]
+        ty = sep_y + 6
+        tx1, ty1 = panel_x + 8, ty
+        tx2, ty2 = panel_x + panel_w - 8, ty + row_h - 5
+        cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), (30, 30, 30), -1)
+        cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), (140, 140, 140), 1)
+        # Minus button
+        btn_w = 28
+        cv2.rectangle(frame, (tx1, ty1), (tx1 + btn_w, ty2), (80, 40, 40), -1)
+        cv2.putText(frame, "-", (tx1 + 8, ty1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 180), 2)
+        rects["threshold_minus"] = (tx1, ty1, tx1 + btn_w, ty2)
+        # Plus button
+        cv2.rectangle(frame, (tx2 - btn_w, ty1), (tx2, ty2), (40, 80, 40), -1)
+        cv2.putText(frame, "+", (tx2 - btn_w + 6, ty1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
+        rects["threshold_plus"] = (tx2 - btn_w, ty1, tx2, ty2)
+        # Label
+        cv2.putText(frame, f"Threshold: {thr:.2f}", (tx1 + btn_w + 8, ty1 + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
         # Model selector row
         model_name = os.path.splitext(os.path.basename(ui["model_paths"][ui["model_idx"]]))[0]
-        my = sep_y + 6
+        my = ty2 + 6
         mx1, my1 = panel_x + 8, my
         mx2, my2 = panel_x + panel_w - 8, my + row_h - 5
         cv2.rectangle(frame, (mx1, my1), (mx2, my2), (40, 60, 100), -1)
@@ -281,6 +312,7 @@ def main():
                 "show_detection_count": True,
                 "show_fps": False,
                 "auto_save": False,
+                "threshold": CONFIDENCE_THRESHOLD,
             },
             "model_paths": model_paths,
             "model_idx": model_idx,
@@ -393,7 +425,7 @@ def main():
                 inference_time = time.time() - inference_start
 
                 boxes, scores, class_ids = postprocess_detections(
-                    outputs, cap_width, cap_height, scale, pad_top, pad_left, CONFIDENCE_THRESHOLD
+                    outputs, cap_width, cap_height, scale, pad_top, pad_left, ui["settings"]["threshold"]
                 )
 
                 last_result_frame = capture_bgr.copy()
