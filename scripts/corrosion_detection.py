@@ -7,7 +7,7 @@ from datetime import datetime
 import os
 
 # Configuration
-MODEL_PATH = "../models/development/yolov8n_static_int8.onnx"
+MODEL_PATH = "../models/yolov8n_static_int8.onnx"
 DETECTIONS_FOLDER = "../detections"
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
@@ -264,7 +264,7 @@ def main():
         fps, fps_counter, fps_timer = 0, 0, time.time()
 
         # Scan for available models in the models folder
-        model_dir = os.path.join(os.path.dirname(MODEL_PATH), "..")
+        model_dir = os.path.dirname(MODEL_PATH)
         model_paths = sorted([
             os.path.join(model_dir, f)
             for f in os.listdir(model_dir) if f.endswith(".onnx")
