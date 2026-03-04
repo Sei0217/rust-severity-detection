@@ -22,6 +22,7 @@ CLASS_NAMES = ["corrosion"]
 SETTING_LABELS = [
     ("show_inference_time", "Show Inference Time"),
     ("show_detection_count", "Show Detection Count"),
+    ("show_fps", "Show FPS"),
     ("auto_save", "Auto-Save (skip review)"),
 ]
 
@@ -47,6 +48,13 @@ def on_mouse(event, x, y, _flags, ui):
                     setting_key = key[4:]
                     ui["settings"][setting_key] = not ui["settings"][setting_key]
                     return
+        # Model row click → cycle to next model
+        if "model_row" in rects:
+            mrx1, mry1, mrx2, mry2 = rects["model_row"]
+            if mrx1 <= x <= mrx2 and mry1 <= y <= mry2:
+                ui["model_idx"] = (ui["model_idx"] + 1) % len(ui["model_paths"])
+                ui["model_changed"] = True
+                return
         # Click outside the panel → close it
         if "panel" in rects:
             px1, py1, px2, py2 = rects["panel"]
@@ -69,8 +77,8 @@ def draw_settings_ui(frame, ui):
 
     if ui["show_settings"]:
         row_h = 34
-        panel_w = 240
-        panel_h = 15 + len(SETTING_LABELS) * row_h + 8
+        panel_w = 260
+        panel_h = 15 + len(SETTING_LABELS) * row_h + 12 + row_h + 8
         panel_x = w - panel_w - 5
         panel_y = btn_y2 + 4
 
@@ -83,6 +91,7 @@ def draw_settings_ui(frame, ui):
                       (panel_x + panel_w, panel_y + panel_h), (130, 130, 130), 1)
         rects["panel"] = (panel_x, panel_y, panel_x + panel_w, panel_y + panel_h)
 
+        # Toggle rows
         for i, (key, label) in enumerate(SETTING_LABELS):
             ry = panel_y + 10 + i * row_h
             rx1, ry1 = panel_x + 8, ry
@@ -95,6 +104,21 @@ def draw_settings_ui(frame, ui):
             cv2.putText(frame, f"{label}  [{status}]", (rx1 + 6, ry1 + 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             rects[f"opt_{key}"] = (rx1, ry1, rx2, ry2)
+
+        # Separator
+        sep_y = panel_y + 10 + len(SETTING_LABELS) * row_h + 4
+        cv2.line(frame, (panel_x + 8, sep_y), (panel_x + panel_w - 8, sep_y), (100, 100, 100), 1)
+
+        # Model selector row
+        model_name = os.path.splitext(os.path.basename(ui["model_paths"][ui["model_idx"]]))[0]
+        my = sep_y + 6
+        mx1, my1 = panel_x + 8, my
+        mx2, my2 = panel_x + panel_w - 8, my + row_h - 5
+        cv2.rectangle(frame, (mx1, my1), (mx2, my2), (40, 60, 100), -1)
+        cv2.rectangle(frame, (mx1, my1), (mx2, my2), (140, 140, 140), 1)
+        cv2.putText(frame, f"Model: {model_name} >", (mx1 + 6, my1 + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 220, 255), 1)
+        rects["model_row"] = (mx1, my1, mx2, my2)
 
     ui["rects"] = rects
 
@@ -237,17 +261,34 @@ def main():
         boxes, scores, class_ids = [], [], []
         inference_time = 0
         last_result_frame = None
+        fps, fps_counter, fps_timer = 0, 0, time.time()
+
+        # Scan for available models in the same folder as MODEL_PATH
+        model_dir = os.path.dirname(MODEL_PATH) or "."
+        model_paths = sorted([
+            os.path.join(model_dir, f)
+            for f in os.listdir(model_dir) if f.endswith(".onnx")
+        ]) or [MODEL_PATH]
+        model_idx = next(
+            (i for i, p in enumerate(model_paths) if os.path.abspath(p) == os.path.abspath(MODEL_PATH)),
+            0
+        )
+
         ui = {
             "show_settings": False,
             "settings": {
                 "show_inference_time": True,
                 "show_detection_count": True,
+                "show_fps": False,
                 "auto_save": False,
             },
+            "model_paths": model_paths,
+            "model_idx": model_idx,
+            "model_changed": False,
             "rects": {}
         }
 
-        cv2.namedWindow("RustWatch - Corrosion Detection")
+        cv2.namedWindow("RustWatch - Corrosion Detection", cv2.WINDOW_NORMAL)
         cv2.setMouseCallback("RustWatch - Corrosion Detection", on_mouse, ui)
 
         print("\n=== DETECTION STARTED ===")
@@ -260,6 +301,13 @@ def main():
         while True:
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            # FPS counter
+            fps_counter += 1
+            if time.time() - fps_timer >= 1.0:
+                fps = fps_counter
+                fps_counter = 0
+                fps_timer = time.time()
 
             if reviewing:
                 # --- REVIEW STATE: show frozen capture with detection results ---
@@ -281,6 +329,9 @@ def main():
                 display_frame = frame_bgr.copy()
                 cv2.putText(display_frame, "LIVE  |  [SPACE] Capture", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2)
+                if ui["settings"]["show_fps"]:
+                    cv2.putText(display_frame, f"FPS: {fps}", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             draw_settings_ui(display_frame, ui)
 
@@ -377,6 +428,19 @@ def main():
                 print("Retaking — back to live preview")
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
+
+            # Reload model if changed via settings panel
+            if ui["model_changed"]:
+                ui["model_changed"] = False
+                new_path = ui["model_paths"][ui["model_idx"]]
+                print(f"Switching model: {os.path.basename(new_path)}")
+                try:
+                    session = ort.InferenceSession(new_path)
+                    input_name = session.get_inputs()[0].name
+                    print(f"✓ Model loaded: {os.path.basename(new_path)}")
+                except Exception as e:
+                    print(f"Failed to load model: {e}")
+                    ui["model_idx"] = (ui["model_idx"] - 1) % len(ui["model_paths"])
     
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
