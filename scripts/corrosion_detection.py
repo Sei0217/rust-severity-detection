@@ -5,6 +5,7 @@ from picamera2 import Picamera2
 import time
 from datetime import datetime
 import os
+from severity import analyze_rust
 
 # Configuration
 MODEL_PATH = "../models/yolov8n.onnx"
@@ -297,6 +298,7 @@ def main():
         boxes, scores, class_ids = [], [], []
         inference_time = 0
         last_result_frame = None
+        rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
         fps, fps_counter, fps_timer = 0, 0, time.time()
 
         # Scan for available models in the models folder
@@ -362,6 +364,15 @@ def main():
                     hud += f"  |  Inference: {inference_time*1000:.1f}ms"
                 cv2.putText(display_frame, hud, (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                # Severity line
+                severity = rust_analysis["severity"]
+                sev_color = {"NONE": (180, 180, 180), "LOCALIZED": (0, 200, 0),
+                             "DISTRIBUTED": (0, 200, 200), "EXTENSIVE": (0, 0, 255)}.get(severity, (255, 255, 255))
+                sev_text = (f"Severity: {severity}  |  "
+                            f"Patches: {rust_analysis['num_patches']}  |  "
+                            f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
+                cv2.putText(display_frame, sev_text, (10, 58),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, sev_color, 2)
             else:
                 # --- LIVE PREVIEW STATE ---
                 display_frame = frame_bgr.copy()
@@ -441,6 +452,12 @@ def main():
                     outputs, cap_width, cap_height, scale, pad_top, pad_left, ui["settings"]["threshold"]
                 )
 
+                det_dicts = [{"bbox": box} for box in boxes]
+                rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width))
+                print(f"Severity: {rust_analysis['severity']}  |  "
+                      f"Patches: {rust_analysis['num_patches']}  |  "
+                      f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
+
                 last_result_frame = capture_bgr.copy()
                 if len(boxes) > 0:
                     last_result_frame = draw_detections(last_result_frame, boxes, scores, class_ids)
@@ -467,12 +484,14 @@ def main():
                 print(f"✓ Saved: {save_path}")
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
+                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
 
             elif key == ord('r') and reviewing:
                 # Discard capture and return to live preview
                 print("Retaking — back to live preview")
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
+                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
 
             # Reload model if changed via settings panel
             if ui["model_changed"]:
