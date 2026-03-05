@@ -470,7 +470,7 @@ def main():
                 )
 
                 det_dicts = [{"bbox": box} for box in boxes]
-                rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width))
+                rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width), capture_bgr)
                 print(f"Severity: {rust_analysis['severity']}  |  "
                       f"Patches: {rust_analysis['num_patches']}  |  "
                       f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
