@@ -294,11 +294,19 @@ def main():
         
         time.sleep(2)
         
+        # Attempt to enable continuous autofocus (Camera Module 3 only; ignored on fixed-focus cameras)
+        try:
+            picam2.set_controls({"AfMode": 2})  # 2 = Continuous AF
+            print("✓ Continuous autofocus enabled")
+        except Exception:
+            print("  Autofocus not supported on this camera (fixed-focus)")
+
         reviewing = False
         boxes, scores, class_ids = [], [], []
         inference_time = 0
         last_result_frame = None
-        rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
+        blur_score = 999.0
+        rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
         fps, fps_counter, fps_timer = 0, 0, time.time()
 
         # Scan for available models in the models folder
@@ -373,6 +381,15 @@ def main():
                             f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
                 cv2.putText(display_frame, sev_text, (10, 58),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, sev_color, 2)
+                # Warnings for low-quality captures
+                warn_y = 86
+                if blur_score < 100.0:
+                    cv2.putText(display_frame, f"! BLURRY IMAGE (score: {blur_score:.0f})",
+                               (10, warn_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+                    warn_y += 24
+                if rust_analysis.get("suspicious"):
+                    cv2.putText(display_frame, "! BOX COVERS FULL FRAME — POSSIBLE FALSE POSITIVE",
+                               (10, warn_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
             else:
                 # --- LIVE PREVIEW STATE ---
                 display_frame = frame_bgr.copy()
@@ -458,6 +475,10 @@ def main():
                       f"Patches: {rust_analysis['num_patches']}  |  "
                       f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
 
+                # Blur score: Laplacian variance — low value = blurry image
+                gray = cv2.cvtColor(capture_bgr, cv2.COLOR_BGR2GRAY)
+                blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+
                 last_result_frame = capture_bgr.copy()
                 if len(boxes) > 0:
                     last_result_frame = draw_detections(last_result_frame, boxes, scores, class_ids)
@@ -484,14 +505,16 @@ def main():
                 print(f"✓ Saved: {save_path}")
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
-                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
+                blur_score = 999.0
+                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
 
             elif key == ord('r') and reviewing:
                 # Discard capture and return to live preview
                 print("Retaking — back to live preview")
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
-                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0}
+                blur_score = 999.0
+                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
 
             # Reload model if changed via settings panel
             if ui["model_changed"]:

@@ -126,10 +126,19 @@ def analyze_rust(
             "avg_patch_size": 0.0,
             "max_patch_size": 0,
             "severity": "NONE",
+            "suspicious": False,
         }
     metrics = calculate_metrics(detections, image_size)
     severity = classify_severity(metrics)
-    return {**metrics, "severity": severity}
+
+    # Flag if any single box covers more than 80% of the frame — likely a false positive
+    total_pixels = image_size[0] * image_size[1]
+    suspicious = any(
+        (d["bbox"][2] - d["bbox"][0]) * (d["bbox"][3] - d["bbox"][1]) / total_pixels > 0.80
+        for d in detections
+    )
+
+    return {**metrics, "severity": severity, "suspicious": suspicious}
 
 
 # ---------------------------------------------------------------------------
