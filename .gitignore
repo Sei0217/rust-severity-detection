@@ -1,3 +1,6 @@
 backup/
 calibration_images/
 quantization/
+training/
+.env
+*.env
