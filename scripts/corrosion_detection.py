@@ -8,7 +8,7 @@ import os
 from severity import analyze_rust
 
 # Configuration
-MODEL_PATH = "../models/yolov8n.onnx"
+MODEL_PATH = "../models/best.onnx"
 DETECTIONS_FOLDER = "../detections"
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
@@ -16,8 +16,16 @@ INPUT_SIZE = 640
 # Create detections folder
 os.makedirs(DETECTIONS_FOLDER, exist_ok=True)
 
-# Class names
-CLASS_NAMES = ["corrosion"]
+# Class names — order MUST match the model's output index ordering.
+# This model was trained with the names {0: 'high', 1: 'low', 2: 'medium'}.
+CLASS_NAMES = ["high", "low", "medium"]
+
+# Per-class drawing color (BGR) for detection boxes
+CLASS_COLORS = {
+    "high":   (0,   0, 255),   # red
+    "medium": (0, 200, 255),   # amber
+    "low":    (0, 200,   0),   # green
+}
 
 # Settings panel definition: (settings_key, display_label)
 SETTING_LABELS = [
@@ -193,81 +201,77 @@ def preprocess_image(image, input_size):
     return input_image, scale, pad_top, pad_left
 
 def postprocess_detections(outputs, img_width, img_height, scale, pad_top, pad_left, conf_threshold):
-    """Post-process YOLO outputs with correct scaling and NMS format"""
+    """Post-process multi-class YOLOv8 output: [1, 4+nc, 8400] → boxes/scores/class_ids."""
     predictions = np.squeeze(outputs[0])
-    predictions = np.transpose(predictions)
-    
-    # Debug output
-    max_conf = np.max(predictions[:, 4])
-    num_above = np.sum(predictions[:, 4] >= conf_threshold)
+    predictions = np.transpose(predictions)  # → [8400, 4+nc]
+
+    class_scores = predictions[:, 4:]
+    per_row_conf = class_scores.max(axis=1)
+    per_row_cls  = class_scores.argmax(axis=1)
+
+    max_conf = float(per_row_conf.max()) if per_row_conf.size else 0.0
+    num_above = int((per_row_conf >= conf_threshold).sum())
     print(f"Max confidence: {max_conf:.3f}, Predictions above {conf_threshold}: {num_above}")
-    
+
     boxes = []
     scores = []
     class_ids = []
-    
-    # YOLOv8 outputs: [8400, 5 or 6]
-    # Each row: [x_center, y_center, width, height, confidence, (optional class)]
-    for pred in predictions:
-        confidence = pred[4]
-        
-        if confidence >= conf_threshold:
-            # Coordinates are already in pixels (0-640), NOT normalized
-            x_center, y_center, w, h = pred[:4]
-            
-            # Adjust for padding and scale to original image size
-            x1 = (x_center - w / 2 - pad_left) / scale
-            y1 = (y_center - h / 2 - pad_top) / scale
-            width = w / scale
-            height = h / scale
-            
-            # Clip to image boundaries
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            width = min(width, img_width - x1)
-            height = min(height, img_height - y1)
-            
-            # Only add valid boxes
-            if width > 5 and height > 5:
-                # NMS expects [x, y, width, height]
-                boxes.append([int(x1), int(y1), int(width), int(height)])
-                scores.append(float(confidence))
-                class_ids.append(0)
-    
-    # Apply NMS
-    if len(boxes) > 0:
-        indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.45)
-        if len(indices) > 0:
-            final_boxes = []
-            final_scores = []
-            final_ids = []
-            
-            for i in indices.flatten():
-                b = boxes[i]
-                # Convert [x, y, w, h] to [x1, y1, x2, y2] for drawing
-                final_boxes.append([b[0], b[1], b[0] + b[2], b[1] + b[3]])
-                final_scores.append(scores[i])
-                final_ids.append(0)
-            
-            print(f"✓ {len(final_boxes)} detections after NMS")
-            return final_boxes, final_scores, final_ids
-    
-    return [], [], []
+
+    for pred, confidence, cls_id in zip(predictions, per_row_conf, per_row_cls):
+        if confidence < conf_threshold:
+            continue
+
+        # Pixel-space center/size (model uses 0–INPUT_SIZE coords, not normalized)
+        x_center, y_center, w, h = pred[:4]
+
+        x1 = (x_center - w / 2 - pad_left) / scale
+        y1 = (y_center - h / 2 - pad_top) / scale
+        width  = w / scale
+        height = h / scale
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        width  = min(width,  img_width  - x1)
+        height = min(height, img_height - y1)
+
+        if width > 5 and height > 5:
+            boxes.append([int(x1), int(y1), int(width), int(height)])
+            scores.append(float(confidence))
+            class_ids.append(int(cls_id))
+
+    if len(boxes) == 0:
+        return [], [], []
+
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.45)
+    if len(indices) == 0:
+        return [], [], []
+
+    final_boxes, final_scores, final_ids = [], [], []
+    for i in indices.flatten():
+        b = boxes[i]
+        final_boxes.append([b[0], b[1], b[0] + b[2], b[1] + b[3]])
+        final_scores.append(scores[i])
+        final_ids.append(class_ids[i])
+
+    print(f"✓ {len(final_boxes)} detections after NMS")
+    return final_boxes, final_scores, final_ids
 
 def draw_detections(image, boxes, scores, class_ids):
-    """Draw bounding boxes on image"""
+    """Draw bounding boxes colored by severity class."""
     for box, score, class_id in zip(boxes, scores, class_ids):
         x1, y1, x2, y2 = box
-        # Red box
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        # Label
-        label = f"{CLASS_NAMES[class_id]}: {score:.2f}"
+        class_name = CLASS_NAMES[class_id]
+        color = CLASS_COLORS.get(class_name, (0, 0, 255))
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+        label = f"{class_name}: {score:.2f}"
         (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         if y1 - label_h - 5 >= 0:
-            cv2.rectangle(image, (x1, y1 - label_h - 5), (x1 + label_w, y1), (0, 0, 255), -1)
+            cv2.rectangle(image, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
             cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         else:
-            cv2.rectangle(image, (x1, y1), (x1 + label_w, y1 + label_h + 5), (0, 0, 255), -1)
+            cv2.rectangle(image, (x1, y1), (x1 + label_w, y1 + label_h + 5), color, -1)
             cv2.putText(image, label, (x1, y1 + label_h + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     return image
 
@@ -374,8 +378,8 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 # Severity line
                 severity = rust_analysis["severity"]
-                sev_color = {"NONE": (180, 180, 180), "LOCALIZED": (0, 200, 0),
-                             "DISTRIBUTED": (0, 200, 200), "EXTENSIVE": (0, 0, 255)}.get(severity, (255, 255, 255))
+                sev_color = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
+                             "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}.get(severity, (255, 255, 255))
                 sev_text = (f"Severity: {severity}  |  "
                             f"Patches: {rust_analysis['num_patches']}  |  "
                             f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
@@ -469,7 +473,10 @@ def main():
                     outputs, cap_width, cap_height, scale, pad_top, pad_left, ui["settings"]["threshold"]
                 )
 
-                det_dicts = [{"bbox": box} for box in boxes]
+                det_dicts = [
+                    {"bbox": box, "class": CLASS_NAMES[cls_id]}
+                    for box, cls_id in zip(boxes, class_ids)
+                ]
                 rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width), capture_bgr)
                 print(f"Severity: {rust_analysis['severity']}  |  "
                       f"Patches: {rust_analysis['num_patches']}  |  "
