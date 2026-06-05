@@ -129,8 +129,8 @@ class Touch:
         self.swap_xy, self.flip_x, self.flip_y, self.debug = swap_xy, flip_x, flip_y, debug
         self.x = self.y = 0
         self.down_time = None
-        # Post-normalize linear correction from 2-tap calibration (identity = none)
-        self.cal_x0, self.cal_y0, self.cal_x1, self.cal_y1 = 0.0, 0.0, 1.0, 1.0
+        # Affine correction (corrected = a*raw + b) from 2-tap calibration
+        self.cal_ax, self.cal_bx, self.cal_ay, self.cal_by = 1.0, 0.0, 1.0, 0.0
         self.xmin, self.xmax = self._range(ABS_X)
         self.ymin, self.ymax = self._range(ABS_Y)
 
@@ -154,8 +154,8 @@ class Touch:
             nx = 1.0 - nx
         if self.flip_y:
             ny = 1.0 - ny
-        nx = (nx - self.cal_x0) / max(1e-6, self.cal_x1 - self.cal_x0)
-        ny = (ny - self.cal_y0) / max(1e-6, self.cal_y1 - self.cal_y0)
+        nx = self.cal_ax * nx + self.cal_bx
+        ny = self.cal_ay * ny + self.cal_by
         return min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny))
 
     def poll(self):
@@ -333,9 +333,9 @@ def wait_for_tap(touch):
 
 
 def run_calibration(touch, write_fb, xres, yres):
-    """Show two corner targets, capture taps, return (x0,y0,x1,y1) or None."""
+    """Show two corner targets, capture taps, return affine (ax,bx,ay,by) or None."""
     print("Calibration: tap each target on the LCD.")
-    touch.cal_x0, touch.cal_y0, touch.cal_x1, touch.cal_y1 = 0.0, 0.0, 1.0, 1.0  # identity
+    touch.cal_ax, touch.cal_bx, touch.cal_ay, touch.cal_by = 1.0, 0.0, 1.0, 0.0  # identity
     targets = [("TOP-LEFT", (16, 22)), ("BOTTOM-RIGHT", (xres - 16, yres - 22))]
     obs = []
     for name, (tx, ty) in targets:
@@ -348,11 +348,17 @@ def run_calibration(touch, write_fb, xres, yres):
         write_fb(c)
         obs.append(wait_for_tap(touch))
         time.sleep(0.5)  # debounce between targets
-    (x0, y0), (x1, y1) = obs
-    if abs(x1 - x0) < 0.05 or abs(y1 - y0) < 0.05:
+    (ox0, oy0), (ox1, oy1) = obs
+    if abs(ox1 - ox0) < 0.05 or abs(oy1 - oy0) < 0.05:
         print("Calibration points too close together — ignored.")
         return None
-    return x0, y0, x1, y1
+    # Map observed taps to the crosses' actual screen fractions, so corrected
+    # coords equal screen fractions (matching where draw_settings puts the rows).
+    tfx0, tfy0 = targets[0][1][0] / xres, targets[0][1][1] / yres
+    tfx1, tfy1 = targets[1][1][0] / xres, targets[1][1][1] / yres
+    ax = (tfx1 - tfx0) / (ox1 - ox0)
+    ay = (tfy1 - tfy0) / (oy1 - oy0)
+    return ax, tfx0 - ax * ox0, ay, tfy0 - ay * oy0
 
 
 # ----------------------------------------------------------------------------
@@ -387,21 +393,21 @@ def main():
         if args.calibrate:
             cal = run_calibration(touch, write_fb, xres, yres)
             if cal:
-                touch.cal_x0, touch.cal_y0, touch.cal_x1, touch.cal_y1 = cal
+                touch.cal_ax, touch.cal_bx, touch.cal_ay, touch.cal_by = cal
                 save_cal({"swap_xy": args.swap_xy, "flip_x": args.flip_x, "flip_y": args.flip_y,
-                          "x0": cal[0], "y0": cal[1], "x1": cal[2], "y1": cal[3]})
+                          "ax": cal[0], "bx": cal[1], "ay": cal[2], "by": cal[3]})
                 print(f"Saved touch calibration to {TOUCH_CAL_FILE}")
         else:
             saved = load_cal()
-            if saved:
+            if saved and "ax" in saved:
                 touch.swap_xy = saved.get("swap_xy", touch.swap_xy)
                 touch.flip_x = saved.get("flip_x", touch.flip_x)
                 touch.flip_y = saved.get("flip_y", touch.flip_y)
-                touch.cal_x0 = saved.get("x0", 0.0)
-                touch.cal_y0 = saved.get("y0", 0.0)
-                touch.cal_x1 = saved.get("x1", 1.0)
-                touch.cal_y1 = saved.get("y1", 1.0)
+                touch.cal_ax, touch.cal_bx = saved["ax"], saved["bx"]
+                touch.cal_ay, touch.cal_by = saved["ay"], saved["by"]
                 print("Loaded saved touch calibration.")
+            elif saved:
+                print("Old calibration format — please re-run:  python3 detect_lcd.py --calibrate --flip-x")
 
     # Model list (for the Model setting), like corrosion_detection.py
     model_dir = os.path.dirname(cd.MODEL_PATH)
