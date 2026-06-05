@@ -310,7 +310,7 @@ def main():
         inference_time = 0
         last_result_frame = None
         blur_score = 999.0
-        rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
+        rust_analysis = {"severity": "NONE", "suspicious": False}
         fps, fps_counter, fps_timer = 0, 0, time.time()
 
         # Scan for available models in the models folder
@@ -380,9 +380,7 @@ def main():
                 severity = rust_analysis["severity"]
                 sev_color = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
                              "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}.get(severity, (255, 255, 255))
-                sev_text = (f"Severity: {severity}  |  "
-                            f"Patches: {rust_analysis['num_patches']}  |  "
-                            f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
+                sev_text = f"Severity: {severity}"
                 cv2.putText(display_frame, sev_text, (10, 58),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, sev_color, 2)
                 # Warnings for low-quality captures
@@ -477,10 +475,8 @@ def main():
                     {"bbox": box, "class": CLASS_NAMES[cls_id]}
                     for box, cls_id in zip(boxes, class_ids)
                 ]
-                rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width), capture_bgr)
-                print(f"Severity: {rust_analysis['severity']}  |  "
-                      f"Patches: {rust_analysis['num_patches']}  |  "
-                      f"Coverage: {rust_analysis['coverage_ratio']*100:.1f}%")
+                rust_analysis = analyze_rust(det_dicts, (cap_height, cap_width))
+                print(f"Severity: {rust_analysis['severity']}")
 
                 # Blur score: Laplacian variance — low value = blurry image
                 gray = cv2.cvtColor(capture_bgr, cv2.COLOR_BGR2GRAY)
@@ -513,7 +509,7 @@ def main():
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
                 blur_score = 999.0
-                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
+                rust_analysis = {"severity": "NONE", "suspicious": False}
 
             elif key == ord('r') and reviewing:
                 # Discard capture and return to live preview
@@ -521,7 +517,7 @@ def main():
                 reviewing = False
                 boxes, scores, class_ids = [], [], []
                 blur_score = 999.0
-                rust_analysis = {"severity": "NONE", "num_patches": 0, "coverage_ratio": 0.0, "suspicious": False}
+                rust_analysis = {"severity": "NONE", "suspicious": False}
 
             # Reload model if changed via settings panel
             if ui["model_changed"]:
