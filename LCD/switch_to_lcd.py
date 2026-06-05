@@ -2,29 +2,33 @@
 """
 switch_to_lcd.py
 
-Switch Raspberry Pi 5 to the 3.5 inch MPI3501 / ILI9486 LCD mode.
+Switch the Raspberry Pi 5 to the 3.5" ILI9486 SPI LCD as a TEXT CONSOLE.
 
 Run:
-  sudo python3 switch_to_lcd.py
+  sudo python3 switch_to_lcd.py                 # switch + reboot
+  sudo python3 switch_to_lcd.py --no-reboot     # apply, don't reboot
+  sudo python3 switch_to_lcd.py --rotate 270    # other landscape orientation
+  sudo python3 switch_to_lcd.py --keep-hdmi     # leave HDMI enabled too
 
 What it does:
-  - backs up /boot/firmware/config.txt
-  - backs up /boot/firmware/cmdline.txt
-  - enables SPI
-  - enables vc4-kms-v3d
-  - disables old/wrong LCD overlay lines
-  - enables the piscreen DRM overlay
-  - disables HDMI in cmdline.txt so the desktop should use the LCD
-  - enables desktop autologin for eaglekim
+  - backs up config.txt and cmdline.txt
+  - enables SPI and loads the piscreen overlay
+    (fb_ili9486 driver -> /dev/fb1, 480x320)
+  - maps the kernel console to the LCD (fbcon=map:1) so you can log in and
+    type on the panel
+  - disables HDMI so the LCD is the active display (unless --keep-hdmi)
+  - boots to the text console (no desktop) with autologin for USER
   - reboots
 
-If the LCD orientation is wrong, edit LCD_ROTATE below:
-  90 or 270 = landscape choices
-  0 or 180 = portrait choices
+Confirmed working on a Raspberry Pi 5 (kernel 6.18, Bookworm) with a generic
+PiScreen-compatible ILI9486 480x320 SPI panel.
+
+Rotation (LCD_ROTATE / --rotate): 90 or 270 = landscape, 0 or 180 = portrait.
 """
 
 from pathlib import Path
 from datetime import datetime
+import argparse
 import os
 import pwd
 import re
@@ -36,28 +40,17 @@ CONFIG = Path("/boot/firmware/config.txt")
 CMDLINE = Path("/boot/firmware/cmdline.txt")
 
 USER = "eaglekim"
-# Panel rotation. The piscreen panel is natively 320x480 (portrait).
-#   90 or 270 = landscape   |   0 or 180 = portrait
-# If the orientation is wrong, change this value and re-run.
-LCD_ROTATE = 90
-LCD_SPEED = 18000000
+LCD_ROTATE = 90           # 90/270 = landscape, 0/180 = portrait
+LCD_SPEED = 16000000      # 16 MHz - stable for ILI9486 (80 MHz is out of spec)
 
 HDMI_DISABLE_TOKENS = ["video=HDMI-A-1:d", "video=HDMI-A-2:d"]
+FBCON_TOKEN = "fbcon=map:1"
 
 BEGIN = "# ===== DISPLAY SWITCH MANAGED BEGIN ====="
 END = "# ===== DISPLAY SWITCH MANAGED END ====="
 
-LIGHTDM_DIR = Path("/etc/lightdm/lightdm.conf.d")
-LIGHTDM_AUTOCONF = LIGHTDM_DIR / "99-display-switch-autologin.conf"
 GETTY_DIR = Path("/etc/systemd/system/getty@tty1.service.d")
 GETTY_AUTOCONF = GETTY_DIR / "autologin.conf"
-
-# The Wayland compositor on the Pi (vc4 GPU) cannot render onto the SPI
-# panel, so the desktop must run under X11 with the fbdev driver pointed at
-# the panel's framebuffer. This snippet does that.
-XORG_CONF_DIR = Path("/usr/share/X11/xorg.conf.d")
-XORG_LCD_CONF = XORG_CONF_DIR / "99-lcd-fbdev.conf"
-FB_DEVICE = "/dev/fb1"
 
 def require_root():
     if os.geteuid() != 0:
@@ -79,31 +72,44 @@ def strip_managed_block(s: str) -> str:
         flags=re.S,
     )
 
-def enable_autologin():
+def clean_old_config(s: str) -> str:
+    """Remove our previous managed block and the junk left by the old
+    home-grown script (duplicated decorative headers, the non-existent
+    ili9486 overlay, legacy hotplug-ignore, stray piscreen lines)."""
+    s = strip_managed_block(s)
+    # Old decorative section headers (the old script appended these every run)
+    s = re.sub(r"^[ \t]*# ===== ILI9486 LCD Configuration =====[ \t]*$\n?", "", s, flags=re.M)
+    s = re.sub(r"^[ \t]*# ===== HDMI Monitor Configuration =====[ \t]*$\n?", "", s, flags=re.M)
+    # Neutralize lines we manage ourselves / that don't work
+    s = re.sub(r"^[ \t]*dtoverlay=ili9486.*$", lambda m: "# " + m.group(0), s, flags=re.M)
+    s = re.sub(r"^[ \t]*dtoverlay=piscreen.*$", lambda m: "# " + m.group(0), s, flags=re.M)
+    s = re.sub(r"^[ \t]*hdmi_ignore_hotplug=1[ \t]*$", "# hdmi_ignore_hotplug=1", s, flags=re.M)
+    # Collapse runs of blank lines
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
+
+def ensure_spi(s: str) -> str:
+    if re.search(r"^[ \t]*#[ \t]*dtparam=spi=on[ \t]*$", s, flags=re.M):
+        return re.sub(r"^[ \t]*#[ \t]*dtparam=spi=on[ \t]*$", "dtparam=spi=on", s, flags=re.M)
+    if not re.search(r"^[ \t]*dtparam=spi=on[ \t]*$", s, flags=re.M):
+        return s + "\ndtparam=spi=on\n"
+    return s
+
+def enable_console_autologin():
+    """Boot to the text console (no desktop) and auto-login USER on tty1."""
     try:
         pwd.getpwnam(USER)
     except KeyError:
         print(f"Warning: user {USER} not found, skipping autologin.")
         return
 
-    print(f"Enabling autologin for {USER}")
-
-    if shutil.which("raspi-config"):
-        subprocess.run(["raspi-config", "nonint", "do_boot_behaviour", "B4"], check=False)
+    print(f"Enabling console autologin for {USER}")
 
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "set-default", "graphical.target"], check=False)
-        subprocess.run(["systemctl", "enable", "lightdm.service"], check=False)
-
-    for group in ("autologin", "nopasswdlogin"):
-        subprocess.run(["groupadd", "-f", group], check=False)
-        subprocess.run(["usermod", "-a", "-G", group, USER], check=False)
-
-    LIGHTDM_DIR.mkdir(parents=True, exist_ok=True)
-    LIGHTDM_AUTOCONF.write_text(f"""[Seat:*]
-autologin-user={USER}
-autologin-user-timeout=0
-""")
+        subprocess.run(["systemctl", "set-default", "multi-user.target"], check=False)
+    if shutil.which("raspi-config"):
+        # B2 = console + autologin
+        subprocess.run(["raspi-config", "nonint", "do_boot_behaviour", "B2"], check=False)
 
     GETTY_DIR.mkdir(parents=True, exist_ok=True)
     GETTY_AUTOCONF.write_text(f"""[Service]
@@ -114,34 +120,16 @@ ExecStart=-/sbin/agetty --autologin {USER} --noclear %I $TERM
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "daemon-reload"], check=False)
 
-def configure_lcd_desktop():
-    """Make the X11 desktop render to the SPI panel's framebuffer.
-
-    Wayland on the Pi cannot drive the SPI panel, so the session is forced
-    to X11 and an xorg snippet points the fbdev driver at /dev/fb1.
-    Rotation is handled by the overlay's rotate= value (see LCD_ROTATE).
-    """
-    # Force the desktop session to X11 (W1). Wayland can't use the SPI panel.
-    if shutil.which("raspi-config"):
-        subprocess.run(["raspi-config", "nonint", "do_wayland", "W1"], check=False)
-
-    # The fbdev X driver is required to target /dev/fb1.
-    if shutil.which("apt-get"):
-        subprocess.run(
-            ["apt-get", "install", "-y", "xserver-xorg-video-fbdev"],
-            check=False,
-        )
-
-    XORG_CONF_DIR.mkdir(parents=True, exist_ok=True)
-    XORG_LCD_CONF.write_text(f"""Section "Device"
-    Identifier "LCD"
-    Driver "fbdev"
-    Option "fbdev" "{FB_DEVICE}"
-EndSection
-""")
-    print(f"Wrote {XORG_LCD_CONF} (X11 desktop on {FB_DEVICE})")
-
 def main():
+    parser = argparse.ArgumentParser(description="Switch the Pi to the SPI LCD text console.")
+    parser.add_argument("--rotate", type=int, default=LCD_ROTATE,
+                        help="Panel rotation: 90/270 landscape, 0/180 portrait (default 90)")
+    parser.add_argument("--keep-hdmi", action="store_true",
+                        help="Leave HDMI enabled instead of disabling it")
+    parser.add_argument("--no-reboot", action="store_true",
+                        help="Apply changes but do not reboot")
+    args = parser.parse_args()
+
     require_root()
 
     if not CONFIG.exists():
@@ -153,58 +141,32 @@ def main():
         backup(CMDLINE)
 
     s = CONFIG.read_text()
+    s = clean_old_config(s)
+    s = ensure_spi(s)
 
-    # Remove previous managed switch block
-    s = strip_managed_block(s)
-
-    # Enable KMS/DRM
-    s = re.sub(
-        r"^[ \t]*#[ \t]*dtoverlay=vc4-kms-v3d[ \t]*$",
-        "dtoverlay=vc4-kms-v3d",
-        s,
-        flags=re.M,
-    )
-    if not re.search(r"^[ \t]*dtoverlay=vc4-kms-v3d[ \t]*$", s, flags=re.M):
-        s += "\ndtoverlay=vc4-kms-v3d\n"
-
-    # Ensure SPI is on
-    if re.search(r"^[ \t]*#[ \t]*dtparam=spi=on[ \t]*$", s, flags=re.M):
-        s = re.sub(r"^[ \t]*#[ \t]*dtparam=spi=on[ \t]*$", "dtparam=spi=on", s, flags=re.M)
-    elif not re.search(r"^[ \t]*dtparam=spi=on[ \t]*$", s, flags=re.M):
-        s += "\ndtparam=spi=on\n"
-
-    # Comment old/wrong LCD overlay lines
-    for pat in [
-        r"^[ \t]*dtoverlay=ili9486.*$",
-        r"^[ \t]*dtoverlay=fbtft.*$",
-        r"^[ \t]*dtoverlay=piscreen.*$",
-    ]:
-        s = re.sub(pat, lambda m: "# " + m.group(0), s, flags=re.M)
-
-    # Add LCD block
-    s += f"""
+    s = s.rstrip() + f"""
 
 {BEGIN}
-# MPI3501 / 3.5 inch / ILI9486 / 320x480 SPI LCD
-# LCD-only mode. HDMI is disabled in cmdline.txt (video=HDMI-A-*:d).
-dtoverlay=piscreen,drm,rotate={LCD_ROTATE},speed={LCD_SPEED},xohms=100
+# 3.5" ILI9486 SPI LCD as a text console (fb_ili9486 -> /dev/fb1, 480x320)
+dtoverlay=piscreen,speed={LCD_SPEED},rotate={args.rotate}
 {END}
 """
-
     CONFIG.write_text(s)
 
-    # Disable HDMI outputs at KMS/kernel level too
+    # cmdline.txt: console on the LCD (+ disable HDMI unless --keep-hdmi)
     if CMDLINE.exists():
         cmd = CMDLINE.read_text().replace("\n", " ").strip()
-        parts = [p for p in cmd.split() if p not in HDMI_DISABLE_TOKENS]
-        parts.extend(HDMI_DISABLE_TOKENS)
+        drop = set(HDMI_DISABLE_TOKENS) | {FBCON_TOKEN}
+        parts = [p for p in cmd.split() if p not in drop]
+        parts.append(FBCON_TOKEN)
+        if not args.keep_hdmi:
+            parts.extend(HDMI_DISABLE_TOKENS)
         CMDLINE.write_text(" ".join(parts) + "\n")
 
-    configure_lcd_desktop()
-    enable_autologin()
+    enable_console_autologin()
 
-    print("Switched to LCD mode.")
-    if "--no-reboot" in sys.argv:
+    print("Switched to LCD console mode.")
+    if args.no_reboot:
         print("Skipping reboot (--no-reboot). Reboot manually to apply changes.")
         return
     print("Rebooting now...")
