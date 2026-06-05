@@ -8,23 +8,27 @@ instead of cv2.imshow() it converts each frame to the framebuffer's pixel
 format (RGB565) and writes it directly to /dev/fb1.
 
 Capture-on-demand (autoscan disabled): the LCD shows a LIVE preview, and
-detection only runs when you press a key in the terminal.
+detection only runs when you trigger a capture — by TAPPING THE TOUCHSCREEN
+or pressing Enter in the terminal.
 
-Controls (type in the terminal you launched it from):
-    Enter      capture the current frame + run detection (shows result)
-    Enter      (while reviewing) go back to live preview
-    q + Enter  quit
+Controls:
+    Tap panel / Enter      capture the current frame + run detection
+    Tap panel / Enter      (while reviewing) go back to live preview
+    q + Enter              quit
 
 Run from a desktop terminal or a Pi Connect Remote Shell:
     cd <repo>/scripts
     python3 detect_lcd.py
     python3 detect_lcd.py --no-save        # don't save captures
     python3 detect_lcd.py --conf 0.6       # lower confidence threshold
-    python3 detect_lcd.py --fb /dev/fb0    # target a different framebuffer
+    python3 detect_lcd.py --no-touch       # keyboard only
+    python3 detect_lcd.py --touch /dev/input/event3   # force touch device
 
 Requirements:
 - The LCD overlay must be loaded (piscreen -> /dev/fb1). Run `lcd-on` first.
-- The user must be in the 'video' group to write /dev/fb1 without sudo.
+- Must be in the 'video' group to write /dev/fb1, and the 'input' group to
+  read the touchscreen (else touch is skipped and only the keyboard works):
+      sudo usermod -aG video,input $USER   # then log out/in
 - If the colors look red/blue swapped, change COLOR_BGR2BGR565 below to
   COLOR_RGB2BGR565 (some panels expect the opposite channel order).
 """
@@ -34,6 +38,7 @@ import contextlib
 import io
 import os
 import select
+import struct
 import sys
 import time
 from datetime import datetime
@@ -47,6 +52,13 @@ import corrosion_detection as cd
 
 SEV_COLORS = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
               "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}
+
+# Linux input_event: struct timeval (2 longs) + type,code (u16) + value (s32)
+EV_FORMAT = "llHHi"
+EV_SIZE = struct.calcsize(EV_FORMAT)
+EV_KEY = 0x01
+BTN_TOUCH = 0x14a
+TOUCH_DEBOUNCE = 0.4  # seconds, ignore repeat touch-downs within this window
 
 
 def get_fb_geometry(fb_path):
@@ -94,13 +106,80 @@ def make_fb_writer(fb_path):
     return write
 
 
-def read_command():
-    """Non-blocking: return a stripped lowercased stdin line if one is ready,
-    else None. An empty string means the user just pressed Enter."""
-    ready, _, _ = select.select([sys.stdin], [], [], 0)
-    if ready:
-        return sys.stdin.readline().strip().lower()
+def find_touch_device(override=None):
+    """Locate the touchscreen's /dev/input/eventN via /proc/bus/input/devices."""
+    if override:
+        return override
+    try:
+        with open("/proc/bus/input/devices") as f:
+            blocks = f.read().split("\n\n")
+    except OSError:
+        return None
+    for block in blocks:
+        low = block.lower()
+        if "ads7846" in low or "touchscreen" in low:
+            for line in block.splitlines():
+                if line.startswith("H:"):
+                    for tok in line.split():
+                        if tok.startswith("event"):
+                            return f"/dev/input/{tok}"
     return None
+
+
+def open_touch(path):
+    """Open the touch device non-blocking; return fd or None (with a message)."""
+    if not path:
+        print("No touch device found — keyboard only.")
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        print(f"Touch: {path} (tap to capture)")
+        return fd
+    except PermissionError:
+        print(f"Touch found at {path} but permission denied — add yourself to 'input':")
+        print("  sudo usermod -aG input $USER   (then log out/in)")
+    except OSError as e:
+        print(f"Could not open touch device {path}: {e}")
+    return None
+
+
+def touch_pressed(fd):
+    """Drain pending touch events; return True if a touch-DOWN occurred."""
+    pressed = False
+    try:
+        while True:
+            data = os.read(fd, EV_SIZE)
+            if len(data) < EV_SIZE:
+                break
+            _, _, etype, code, value = struct.unpack(EV_FORMAT, data)
+            if etype == EV_KEY and code == BTN_TOUCH and value == 1:
+                pressed = True
+    except BlockingIOError:
+        pass
+    return pressed
+
+
+def poll_trigger(touch_fd, last_touch):
+    """Non-blocking check of stdin + touch.
+    Returns (quit_requested, capture_triggered, last_touch)."""
+    watch = [sys.stdin]
+    if touch_fd is not None:
+        watch.append(touch_fd)
+    ready, _, _ = select.select(watch, [], [], 0)
+    quit_req = trigger = False
+    for r in ready:
+        if r is sys.stdin:
+            line = sys.stdin.readline().strip().lower()
+            if line == "q":
+                quit_req = True
+            else:
+                trigger = True
+        elif touch_pressed(touch_fd):
+            now = time.time()
+            if now - last_touch > TOUCH_DEBOUNCE:
+                trigger = True
+                last_touch = now
+    return quit_req, trigger, last_touch
 
 
 def capture_and_detect(picam2, session, input_name, conf):
@@ -134,12 +213,16 @@ def main():
     parser.add_argument("--no-save", action="store_true", help="Do not save captured frames")
     parser.add_argument("--conf", type=float, default=cd.CONFIDENCE_THRESHOLD,
                         help=f"Confidence threshold (default {cd.CONFIDENCE_THRESHOLD})")
+    parser.add_argument("--touch", default=None, help="Touch input device (default: auto-detect)")
+    parser.add_argument("--no-touch", action="store_true", help="Disable touch, keyboard only")
     args = parser.parse_args()
 
     if not os.path.exists(args.fb):
         raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run lcd-on first.")
 
     write_fb = make_fb_writer(args.fb)
+
+    touch_fd = None if args.no_touch else open_touch(find_touch_device(args.touch))
 
     print(f"Loading model: {cd.MODEL_PATH}")
     session = ort.InferenceSession(cd.MODEL_PATH)
@@ -155,18 +238,19 @@ def main():
     except Exception:
         pass
 
+    trig = "Tap/Enter" if touch_fd is not None else "Enter"
     print("\n=== Capture-on-demand (autoscan OFF) ===")
-    print("  Enter      capture + detect")
-    print("  Enter      (while reviewing) back to live")
+    print(f"  {trig}      capture + detect / back to live")
     print("  q + Enter  quit\n")
 
     reviewing = False
+    last_touch = 0.0
     try:
         while True:
-            cmd = read_command()
-            if cmd is not None:
-                if cmd == "q":
-                    break
+            quit_req, trigger, last_touch = poll_trigger(touch_fd, last_touch)
+            if quit_req:
+                break
+            if trigger:
                 if not reviewing:
                     # Capture + detect, then freeze the result on the LCD
                     frame, boxes, analysis, infer_ms = capture_and_detect(
@@ -179,7 +263,7 @@ def main():
                     if analysis.get("suspicious"):
                         cv2.putText(frame, "! full-frame box", (8, h - 34),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
-                    cv2.putText(frame, "Enter=new  q=quit", (8, h - 12),
+                    cv2.putText(frame, f"{trig}=new  q=quit", (8, h - 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     write_fb(frame)
 
@@ -192,14 +276,14 @@ def main():
                         print(f"Saved {path}")
                     reviewing = True
                 else:
-                    # Any key while reviewing returns to live preview
+                    # Trigger while reviewing returns to live preview
                     reviewing = False
 
             if not reviewing:
                 # LIVE preview (no inference)
                 rgb = picam2.capture_array()
                 frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                cv2.putText(frame, "LIVE  Enter=capture", (8, 26),
+                cv2.putText(frame, f"LIVE  {trig}=capture", (8, 26),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
                 write_fb(frame)
             else:
@@ -210,6 +294,8 @@ def main():
         print("\nStopping...")
     finally:
         picam2.stop()
+        if touch_fd is not None:
+            os.close(touch_fd)
         print("Camera stopped.")
 
 
