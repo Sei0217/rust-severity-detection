@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-detect_lcd.py — headless corrosion detection rendered straight to the 3.5"
-SPI LCD framebuffer (/dev/fb1). No desktop / X11 / cv2 window required.
+detect_lcd.py — corrosion detection rendered straight to the 3.5" SPI LCD
+framebuffer (/dev/fb1). No desktop / X11 / cv2 window required.
 
 It reuses the inference + drawing pipeline from corrosion_detection.py, but
-instead of cv2.imshow() it converts each annotated frame to the framebuffer's
-pixel format (RGB565) and writes it directly to /dev/fb1.
+instead of cv2.imshow() it converts each frame to the framebuffer's pixel
+format (RGB565) and writes it directly to /dev/fb1.
 
-Run from a Pi Connect Remote Shell (so console text stays off the panel):
+Capture-on-demand (autoscan disabled): the LCD shows a LIVE preview, and
+detection only runs when you press a key in the terminal.
+
+Controls (type in the terminal you launched it from):
+    Enter      capture the current frame + run detection (shows result)
+    Enter      (while reviewing) go back to live preview
+    q + Enter  quit
+
+Run from a desktop terminal or a Pi Connect Remote Shell:
     cd <repo>/scripts
     python3 detect_lcd.py
-    python3 detect_lcd.py --no-save        # don't auto-save detections
+    python3 detect_lcd.py --no-save        # don't save captures
     python3 detect_lcd.py --conf 0.6       # lower confidence threshold
     python3 detect_lcd.py --fb /dev/fb0    # target a different framebuffer
 
-Quit with Ctrl+C. Detected frames auto-save to ../detections (5s cooldown).
-
 Requirements:
-- The LCD overlay must be loaded (piscreen -> /dev/fb1). Run `switch-lcd` first.
+- The LCD overlay must be loaded (piscreen -> /dev/fb1). Run `lcd-on` first.
 - The user must be in the 'video' group to write /dev/fb1 without sudo.
 - If the colors look red/blue swapped, change COLOR_BGR2BGR565 below to
   COLOR_RGB2BGR565 (some panels expect the opposite channel order).
@@ -27,6 +33,8 @@ import argparse
 import contextlib
 import io
 import os
+import select
+import sys
 import time
 from datetime import datetime
 
@@ -37,7 +45,8 @@ from picamera2 import Picamera2
 
 import corrosion_detection as cd
 
-SAVE_COOLDOWN = 5.0  # seconds between auto-saves
+SEV_COLORS = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
+              "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}
 
 
 def get_fb_geometry(fb_path):
@@ -85,16 +94,50 @@ def make_fb_writer(fb_path):
     return write
 
 
+def read_command():
+    """Non-blocking: return a stripped lowercased stdin line if one is ready,
+    else None. An empty string means the user just pressed Enter."""
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    if ready:
+        return sys.stdin.readline().strip().lower()
+    return None
+
+
+def capture_and_detect(picam2, session, input_name, conf):
+    """Grab a frame, run inference, and return (annotated_bgr, boxes, analysis, ms)."""
+    rgb = picam2.capture_array()
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    h, w = rgb.shape[:2]
+
+    inp, scale, pad_top, pad_left = cd.preprocess_image(rgb, cd.INPUT_SIZE)
+    t0 = time.time()
+    outputs = session.run(None, {input_name: inp})
+    infer_ms = (time.time() - t0) * 1000
+
+    # postprocess_detections prints debug lines per call; silence them
+    with contextlib.redirect_stdout(io.StringIO()):
+        boxes, scores, ids = cd.postprocess_detections(
+            outputs, w, h, scale, pad_top, pad_left, conf)
+
+    frame = bgr.copy()
+    if boxes:
+        frame = cd.draw_detections(frame, boxes, scores, ids)
+
+    det_dicts = [{"bbox": b, "class": cd.CLASS_NAMES[c]} for b, c in zip(boxes, ids)]
+    analysis = cd.analyze_rust(det_dicts, (h, w))
+    return frame, boxes, analysis, infer_ms
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Headless corrosion detection on the SPI LCD.")
+    parser = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
     parser.add_argument("--fb", default="/dev/fb1", help="Framebuffer device (default /dev/fb1)")
-    parser.add_argument("--no-save", action="store_true", help="Do not auto-save detected frames")
+    parser.add_argument("--no-save", action="store_true", help="Do not save captured frames")
     parser.add_argument("--conf", type=float, default=cd.CONFIDENCE_THRESHOLD,
                         help=f"Confidence threshold (default {cd.CONFIDENCE_THRESHOLD})")
     args = parser.parse_args()
 
     if not os.path.exists(args.fb):
-        raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run switch-lcd first.")
+        raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run lcd-on first.")
 
     write_fb = make_fb_writer(args.fb)
 
@@ -112,50 +155,56 @@ def main():
     except Exception:
         pass
 
-    sev_colors = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
-                  "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}
-    last_save = 0.0
-    print("Detection running — Ctrl+C to stop.")
+    print("\n=== Capture-on-demand (autoscan OFF) ===")
+    print("  Enter      capture + detect")
+    print("  Enter      (while reviewing) back to live")
+    print("  q + Enter  quit\n")
 
+    reviewing = False
     try:
         while True:
-            rgb = picam2.capture_array()
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            h, w = rgb.shape[:2]
+            cmd = read_command()
+            if cmd is not None:
+                if cmd == "q":
+                    break
+                if not reviewing:
+                    # Capture + detect, then freeze the result on the LCD
+                    frame, boxes, analysis, infer_ms = capture_and_detect(
+                        picam2, session, input_name, args.conf)
+                    h = frame.shape[0]
+                    sev = analysis["severity"]
+                    cv2.putText(frame, f"{sev}  det:{len(boxes)}  {infer_ms:.0f}ms",
+                                (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                SEV_COLORS.get(sev, (255, 255, 255)), 2)
+                    if analysis.get("suspicious"):
+                        cv2.putText(frame, "! full-frame box", (8, h - 34),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+                    cv2.putText(frame, "Enter=new  q=quit", (8, h - 12),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    write_fb(frame)
 
-            inp, scale, pad_top, pad_left = cd.preprocess_image(rgb, cd.INPUT_SIZE)
-            t0 = time.time()
-            outputs = session.run(None, {input_name: inp})
-            infer_ms = (time.time() - t0) * 1000
+                    print(f"Captured: severity {sev}, {len(boxes)} detection(s), {infer_ms:.0f}ms")
+                    if not args.no_save:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        prefix = "corrosion" if boxes else "capture"
+                        path = os.path.join(cd.DETECTIONS_FOLDER, f"{prefix}_{ts}.jpg")
+                        cv2.imwrite(path, frame)
+                        print(f"Saved {path}")
+                    reviewing = True
+                else:
+                    # Any key while reviewing returns to live preview
+                    reviewing = False
 
-            # postprocess_detections prints debug lines per call; silence them
-            with contextlib.redirect_stdout(io.StringIO()):
-                boxes, scores, ids = cd.postprocess_detections(
-                    outputs, w, h, scale, pad_top, pad_left, args.conf)
-
-            frame = bgr.copy()
-            if boxes:
-                frame = cd.draw_detections(frame, boxes, scores, ids)
-
-            det_dicts = [{"bbox": b, "class": cd.CLASS_NAMES[c]} for b, c in zip(boxes, ids)]
-            analysis = cd.analyze_rust(det_dicts, (h, w))
-            sev = analysis["severity"]
-
-            hud = f"{sev}  det:{len(boxes)}  {infer_ms:.0f}ms"
-            cv2.putText(frame, hud, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        sev_colors.get(sev, (255, 255, 255)), 2)
-            if analysis.get("suspicious"):
-                cv2.putText(frame, "! full-frame box", (8, h - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
-
-            write_fb(frame)
-
-            if boxes and not args.no_save and time.time() - last_save > SAVE_COOLDOWN:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = os.path.join(cd.DETECTIONS_FOLDER, f"corrosion_{ts}.jpg")
-                cv2.imwrite(path, frame)
-                print(f"Saved {path}  (severity {sev}, {len(boxes)} det)")
-                last_save = time.time()
+            if not reviewing:
+                # LIVE preview (no inference)
+                rgb = picam2.capture_array()
+                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                cv2.putText(frame, "LIVE  Enter=capture", (8, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+                write_fb(frame)
+            else:
+                # Reviewing: hold the frozen result, just poll for input
+                time.sleep(0.03)
 
     except KeyboardInterrupt:
         print("\nStopping...")
