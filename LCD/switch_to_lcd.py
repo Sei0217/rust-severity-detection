@@ -8,7 +8,6 @@ Run:
   sudo python3 switch_to_lcd.py                 # switch + reboot
   sudo python3 switch_to_lcd.py --no-reboot     # apply, don't reboot
   sudo python3 switch_to_lcd.py --rotate 270    # other landscape orientation
-  sudo python3 switch_to_lcd.py --keep-hdmi     # leave HDMI enabled too
 
 What it does:
   - backs up config.txt and cmdline.txt
@@ -16,9 +15,13 @@ What it does:
     (fb_ili9486 driver -> /dev/fb1, 480x320)
   - maps the kernel console to the LCD (fbcon=map:1) so you can log in and
     type on the panel
-  - disables HDMI so the LCD is the active display (unless --keep-hdmi)
   - boots to the text console (no desktop) with autologin for USER
   - reboots
+
+HDMI is intentionally left ENABLED. Disabling it (video=HDMI-A-*:d) renumbers
+the framebuffers so the LCD can become fb0, which breaks `fbcon=map:1` and
+leaves the panel blank. Keeping HDMI on keeps the LCD as a stable /dev/fb1
+(the monitor just stays blank in console mode).
 
 Confirmed working on a Raspberry Pi 5 (kernel 6.18, Bookworm) with a generic
 PiScreen-compatible ILI9486 480x320 SPI panel.
@@ -125,7 +128,7 @@ def main():
     parser.add_argument("--rotate", type=int, default=LCD_ROTATE,
                         help="Panel rotation: 90/270 landscape, 0/180 portrait (default 90)")
     parser.add_argument("--keep-hdmi", action="store_true",
-                        help="Leave HDMI enabled instead of disabling it")
+                        help="(deprecated, no effect) HDMI is always kept enabled now")
     parser.add_argument("--no-reboot", action="store_true",
                         help="Apply changes but do not reboot")
     args = parser.parse_args()
@@ -153,14 +156,14 @@ dtoverlay=piscreen,speed={LCD_SPEED},rotate={args.rotate}
 """
     CONFIG.write_text(s)
 
-    # cmdline.txt: console on the LCD (+ disable HDMI unless --keep-hdmi)
+    # cmdline.txt: map the console to the LCD framebuffer. We also strip any
+    # HDMI-disable tokens from a previous run, because disabling HDMI renumbers
+    # the framebuffers and breaks fbcon=map:1 (see header note).
     if CMDLINE.exists():
         cmd = CMDLINE.read_text().replace("\n", " ").strip()
         drop = set(HDMI_DISABLE_TOKENS) | {FBCON_TOKEN}
         parts = [p for p in cmd.split() if p not in drop]
         parts.append(FBCON_TOKEN)
-        if not args.keep_hdmi:
-            parts.extend(HDMI_DISABLE_TOKENS)
         CMDLINE.write_text(" ".join(parts) + "\n")
 
     enable_console_autologin()
