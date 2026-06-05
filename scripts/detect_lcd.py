@@ -39,6 +39,7 @@ import argparse
 import contextlib
 import fcntl
 import io
+import json
 import os
 import select
 import struct
@@ -65,6 +66,7 @@ ABS_X = 0x00
 ABS_Y = 0x01
 BTN_TOUCH = 0x14a
 LONG_PRESS = 0.6          # seconds held = "long press"
+TOUCH_CAL_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_touch.json")
 
 SETTING_ROWS = ["threshold", "model", "auto_save", "show_fps"]
 ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
@@ -127,6 +129,8 @@ class Touch:
         self.swap_xy, self.flip_x, self.flip_y, self.debug = swap_xy, flip_x, flip_y, debug
         self.x = self.y = 0
         self.down_time = None
+        # Post-normalize linear correction from 2-tap calibration (identity = none)
+        self.cal_x0, self.cal_y0, self.cal_x1, self.cal_y1 = 0.0, 0.0, 1.0, 1.0
         self.xmin, self.xmax = self._range(ABS_X)
         self.ymin, self.ymax = self._range(ABS_Y)
 
@@ -150,6 +154,8 @@ class Touch:
             nx = 1.0 - nx
         if self.flip_y:
             ny = 1.0 - ny
+        nx = (nx - self.cal_x0) / max(1e-6, self.cal_x1 - self.cal_x0)
+        ny = (ny - self.cal_y0) / max(1e-6, self.cal_y1 - self.cal_y0)
         return min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny))
 
     def poll(self):
@@ -300,6 +306,56 @@ def apply_setting(row, side, settings, models, model_idx, reload_model):
 
 
 # ----------------------------------------------------------------------------
+# Touch calibration (2-tap) + persistence
+# ----------------------------------------------------------------------------
+def load_cal():
+    try:
+        with open(TOUCH_CAL_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_cal(d):
+    try:
+        with open(TOUCH_CAL_FILE, "w") as f:
+            json.dump(d, f)
+    except OSError as e:
+        print(f"Could not save calibration: {e}")
+
+
+def wait_for_tap(touch):
+    while True:
+        for kind, nx, ny in touch.poll():
+            if kind in ("tap", "long"):
+                return nx, ny
+        time.sleep(0.02)
+
+
+def run_calibration(touch, write_fb, xres, yres):
+    """Show two corner targets, capture taps, return (x0,y0,x1,y1) or None."""
+    print("Calibration: tap each target on the LCD.")
+    touch.cal_x0, touch.cal_y0, touch.cal_x1, touch.cal_y1 = 0.0, 0.0, 1.0, 1.0  # identity
+    targets = [("TOP-LEFT", (16, 22)), ("BOTTOM-RIGHT", (xres - 16, yres - 22))]
+    obs = []
+    for name, (tx, ty) in targets:
+        c = np.zeros((yres, xres, 3), dtype=np.uint8)
+        cv2.line(c, (tx - 16, ty), (tx + 16, ty), (0, 255, 255), 1)
+        cv2.line(c, (tx, ty - 16), (tx, ty + 16), (0, 255, 255), 1)
+        cv2.circle(c, (tx, ty), 11, (0, 255, 255), 2)
+        cv2.putText(c, f"Tap the {name} cross", (xres // 2 - 120, yres // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        write_fb(c)
+        obs.append(wait_for_tap(touch))
+        time.sleep(0.5)  # debounce between targets
+    (x0, y0), (x1, y1) = obs
+    if abs(x1 - x0) < 0.05 or abs(y1 - y0) < 0.05:
+        print("Calibration points too close together — ignored.")
+        return None
+    return x0, y0, x1, y1
+
+
+# ----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
     p.add_argument("--fb", default="/dev/fb1")
@@ -311,6 +367,8 @@ def main():
     p.add_argument("--flip-x", action="store_true")
     p.add_argument("--flip-y", action="store_true")
     p.add_argument("--touch-debug", action="store_true", help="Print tap coordinates")
+    p.add_argument("--calibrate", action="store_true",
+                   help="Run 2-tap touch calibration (with your --flip/--swap flags) and save it")
     args = p.parse_args()
 
     if not os.path.exists(args.fb):
@@ -323,6 +381,27 @@ def main():
         fd = open_touch(find_touch_device(args.touch))
         if fd is not None:
             touch = Touch(fd, args.swap_xy, args.flip_x, args.flip_y, args.touch_debug)
+
+    # Touch calibration: run it (and save), or load a previously saved one.
+    if touch is not None:
+        if args.calibrate:
+            cal = run_calibration(touch, write_fb, xres, yres)
+            if cal:
+                touch.cal_x0, touch.cal_y0, touch.cal_x1, touch.cal_y1 = cal
+                save_cal({"swap_xy": args.swap_xy, "flip_x": args.flip_x, "flip_y": args.flip_y,
+                          "x0": cal[0], "y0": cal[1], "x1": cal[2], "y1": cal[3]})
+                print(f"Saved touch calibration to {TOUCH_CAL_FILE}")
+        else:
+            saved = load_cal()
+            if saved:
+                touch.swap_xy = saved.get("swap_xy", touch.swap_xy)
+                touch.flip_x = saved.get("flip_x", touch.flip_x)
+                touch.flip_y = saved.get("flip_y", touch.flip_y)
+                touch.cal_x0 = saved.get("x0", 0.0)
+                touch.cal_y0 = saved.get("y0", 0.0)
+                touch.cal_x1 = saved.get("x1", 1.0)
+                touch.cal_y1 = saved.get("y1", 1.0)
+                print("Loaded saved touch calibration.")
 
     # Model list (for the Model setting), like corrosion_detection.py
     model_dir = os.path.dirname(cd.MODEL_PATH)
