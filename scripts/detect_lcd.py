@@ -3,38 +3,41 @@
 detect_lcd.py — corrosion detection rendered straight to the 3.5" SPI LCD
 framebuffer (/dev/fb1). No desktop / X11 / cv2 window required.
 
-It reuses the inference + drawing pipeline from corrosion_detection.py, but
+Reuses the inference + drawing pipeline from corrosion_detection.py, but
 instead of cv2.imshow() it converts each frame to the framebuffer's pixel
 format (RGB565) and writes it directly to /dev/fb1.
 
-Capture-on-demand (autoscan disabled): the LCD shows a LIVE preview, and
-detection only runs when you trigger a capture — by TAPPING THE TOUCHSCREEN
-or pressing Enter in the terminal.
+Capture-on-demand (autoscan disabled) with a touch UI:
+    LIVE     : short-tap / Enter        -> capture + detect
+    REVIEW   : short-tap / Enter        -> back to live
+    anywhere : long-press / 's'+Enter   -> open/close Settings
+    quit     : 'q' + Enter
 
-Controls:
-    Tap panel / Enter      capture the current frame + run detection
-    Tap panel / Enter      (while reviewing) go back to live preview
-    q + Enter              quit
+SETTINGS (tap-zones, no calibration) — 4 full-width rows; tap a row's
+LEFT half to decrease/prev, RIGHT half to increase/next/toggle:
+    Threshold   |  Model  |  Auto-save  |  Show FPS
 
 Run from a desktop terminal or a Pi Connect Remote Shell:
     cd <repo>/scripts
     python3 detect_lcd.py
-    python3 detect_lcd.py --no-save        # don't save captures
-    python3 detect_lcd.py --conf 0.6       # lower confidence threshold
-    python3 detect_lcd.py --no-touch       # keyboard only
-    python3 detect_lcd.py --touch /dev/input/event3   # force touch device
+    python3 detect_lcd.py --conf 0.6
+    python3 detect_lcd.py --no-touch                 # keyboard only
+    python3 detect_lcd.py --swap-xy --flip-y         # fix touch orientation
+    python3 detect_lcd.py --touch-debug              # print tap coords
+
+Touch orientation: if a tapped row/side is mirrored, toggle --swap-xy /
+--flip-x / --flip-y until the on-screen marker lands under your finger.
 
 Requirements:
-- The LCD overlay must be loaded (piscreen -> /dev/fb1). Run `lcd-on` first.
-- Must be in the 'video' group to write /dev/fb1, and the 'input' group to
-  read the touchscreen (else touch is skipped and only the keyboard works):
+- LCD overlay loaded (piscreen -> /dev/fb1). Run `lcd-on` first.
+- Be in 'video' (write /dev/fb1) and 'input' (read touch) groups:
       sudo usermod -aG video,input $USER   # then log out/in
-- If the colors look red/blue swapped, change COLOR_BGR2BGR565 below to
-  COLOR_RGB2BGR565 (some panels expect the opposite channel order).
+- If colors look red/blue swapped, change COLOR_BGR2BGR565 -> COLOR_RGB2BGR565.
 """
 
 import argparse
 import contextlib
+import fcntl
 import io
 import os
 import select
@@ -53,16 +56,24 @@ import corrosion_detection as cd
 SEV_COLORS = {"NONE": (180, 180, 180), "LOW": (0, 200, 0),
               "MEDIUM": (0, 200, 200), "HIGH": (0, 0, 255)}
 
-# Linux input_event: struct timeval (2 longs) + type,code (u16) + value (s32)
+# Linux input_event: struct timeval (2 longs) + type, code (u16) + value (s32)
 EV_FORMAT = "llHHi"
 EV_SIZE = struct.calcsize(EV_FORMAT)
 EV_KEY = 0x01
+EV_ABS = 0x03
+ABS_X = 0x00
+ABS_Y = 0x01
 BTN_TOUCH = 0x14a
-TOUCH_DEBOUNCE = 0.4  # seconds, ignore repeat touch-downs within this window
+LONG_PRESS = 0.6          # seconds held = "long press"
+
+SETTING_ROWS = ["threshold", "model", "auto_save", "show_fps"]
+ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
 
 
+# ----------------------------------------------------------------------------
+# Framebuffer
+# ----------------------------------------------------------------------------
 def get_fb_geometry(fb_path):
-    """Read resolution + bits-per-pixel for /dev/fbN from sysfs."""
     idx = fb_path.rstrip("/").split("fb")[-1]
     base = f"/sys/class/graphics/fb{idx}"
     with open(f"{base}/virtual_size") as f:
@@ -73,7 +84,6 @@ def get_fb_geometry(fb_path):
 
 
 def letterbox(img, tw, th):
-    """Resize img into a tw x th canvas, preserving aspect ratio (black bars)."""
     h, w = img.shape[:2]
     scale = min(tw / w, th / h)
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
@@ -85,7 +95,6 @@ def letterbox(img, tw, th):
 
 
 def make_fb_writer(fb_path):
-    """Open the framebuffer once and return a function that blits a BGR frame."""
     xres, yres, bpp = get_fb_geometry(fb_path)
     print(f"Framebuffer {fb_path}: {xres}x{yres} @ {bpp}bpp")
     if bpp == 16:
@@ -94,7 +103,6 @@ def make_fb_writer(fb_path):
         convert = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2BGRA)
     else:
         raise RuntimeError(f"Unsupported framebuffer depth: {bpp} bpp")
-
     fb = open(fb_path, "r+b")
 
     def write(frame_bgr):
@@ -103,11 +111,78 @@ def make_fb_writer(fb_path):
         fb.write(buf.tobytes())
         fb.flush()
 
-    return write
+    return write, xres, yres
+
+
+# ----------------------------------------------------------------------------
+# Touchscreen (ADS7846) — gesture detection, no calibration
+# ----------------------------------------------------------------------------
+def _eviocgabs(axis):
+    return (2 << 30) | (struct.calcsize("6i") << 16) | (ord("E") << 8) | (0x40 + axis)
+
+
+class Touch:
+    def __init__(self, fd, swap_xy=False, flip_x=False, flip_y=False, debug=False):
+        self.fd = fd
+        self.swap_xy, self.flip_x, self.flip_y, self.debug = swap_xy, flip_x, flip_y, debug
+        self.x = self.y = 0
+        self.down_time = None
+        self.xmin, self.xmax = self._range(ABS_X)
+        self.ymin, self.ymax = self._range(ABS_Y)
+
+    def _range(self, axis, default=(0, 4095)):
+        try:
+            buf = bytearray(struct.calcsize("6i"))
+            fcntl.ioctl(self.fd, _eviocgabs(axis), buf, True)
+            _, mn, mx, *_ = struct.unpack("6i", bytes(buf))
+            if mx > mn:
+                return mn, mx
+        except OSError:
+            pass
+        return default
+
+    def _norm(self, x, y):
+        nx = (x - self.xmin) / max(1, self.xmax - self.xmin)
+        ny = (y - self.ymin) / max(1, self.ymax - self.ymin)
+        if self.swap_xy:
+            nx, ny = ny, nx
+        if self.flip_x:
+            nx = 1.0 - nx
+        if self.flip_y:
+            ny = 1.0 - ny
+        return min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny))
+
+    def poll(self):
+        """Drain events; return list of gestures: ('tap', nx, ny) / ('long', nx, ny)."""
+        gestures = []
+        try:
+            while True:
+                data = os.read(self.fd, EV_SIZE)
+                if len(data) < EV_SIZE:
+                    break
+                _, _, etype, code, value = struct.unpack(EV_FORMAT, data)
+                if etype == EV_ABS:
+                    if code == ABS_X:
+                        self.x = value
+                    elif code == ABS_Y:
+                        self.y = value
+                elif etype == EV_KEY and code == BTN_TOUCH:
+                    if value == 1:
+                        self.down_time = time.time()
+                    elif value == 0 and self.down_time is not None:
+                        dur = time.time() - self.down_time
+                        nx, ny = self._norm(self.x, self.y)
+                        kind = "long" if dur >= LONG_PRESS else "tap"
+                        if self.debug:
+                            print(f"touch {kind}: nx={nx:.2f} ny={ny:.2f} (raw {self.x},{self.y})")
+                        gestures.append((kind, nx, ny))
+                        self.down_time = None
+        except BlockingIOError:
+            pass
+        return gestures
 
 
 def find_touch_device(override=None):
-    """Locate the touchscreen's /dev/input/eventN via /proc/bus/input/devices."""
     if override:
         return override
     try:
@@ -127,175 +202,258 @@ def find_touch_device(override=None):
 
 
 def open_touch(path):
-    """Open the touch device non-blocking; return fd or None (with a message)."""
     if not path:
         print("No touch device found — keyboard only.")
         return None
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        print(f"Touch: {path} (tap to capture)")
+        print(f"Touch: {path}")
         return fd
     except PermissionError:
-        print(f"Touch found at {path} but permission denied — add yourself to 'input':")
+        print(f"Touch at {path} but permission denied — add yourself to 'input':")
         print("  sudo usermod -aG input $USER   (then log out/in)")
     except OSError as e:
         print(f"Could not open touch device {path}: {e}")
     return None
 
 
-def touch_pressed(fd):
-    """Drain pending touch events; return True if a touch-DOWN occurred."""
-    pressed = False
-    try:
-        while True:
-            data = os.read(fd, EV_SIZE)
-            if len(data) < EV_SIZE:
-                break
-            _, _, etype, code, value = struct.unpack(EV_FORMAT, data)
-            if etype == EV_KEY and code == BTN_TOUCH and value == 1:
-                pressed = True
-    except BlockingIOError:
-        pass
-    return pressed
-
-
-def poll_trigger(touch_fd, last_touch):
-    """Non-blocking check of stdin + touch.
-    Returns (quit_requested, capture_triggered, last_touch)."""
-    watch = [sys.stdin]
-    if touch_fd is not None:
-        watch.append(touch_fd)
-    ready, _, _ = select.select(watch, [], [], 0)
-    quit_req = trigger = False
-    for r in ready:
-        if r is sys.stdin:
-            line = sys.stdin.readline().strip().lower()
-            if line == "q":
-                quit_req = True
-            else:
-                trigger = True
-        elif touch_pressed(touch_fd):
-            now = time.time()
-            if now - last_touch > TOUCH_DEBOUNCE:
-                trigger = True
-                last_touch = now
-    return quit_req, trigger, last_touch
-
-
+# ----------------------------------------------------------------------------
+# Detection + drawing
+# ----------------------------------------------------------------------------
 def capture_and_detect(picam2, session, input_name, conf):
-    """Grab a frame, run inference, and return (annotated_bgr, boxes, analysis, ms)."""
     rgb = picam2.capture_array()
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = rgb.shape[:2]
-
     inp, scale, pad_top, pad_left = cd.preprocess_image(rgb, cd.INPUT_SIZE)
     t0 = time.time()
     outputs = session.run(None, {input_name: inp})
     infer_ms = (time.time() - t0) * 1000
-
-    # postprocess_detections prints debug lines per call; silence them
     with contextlib.redirect_stdout(io.StringIO()):
         boxes, scores, ids = cd.postprocess_detections(
             outputs, w, h, scale, pad_top, pad_left, conf)
-
     frame = bgr.copy()
     if boxes:
         frame = cd.draw_detections(frame, boxes, scores, ids)
-
     det_dicts = [{"bbox": b, "class": cd.CLASS_NAMES[c]} for b, c in zip(boxes, ids)]
     analysis = cd.analyze_rust(det_dicts, (h, w))
     return frame, boxes, analysis, infer_ms
 
 
+def model_name(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def draw_settings(xres, yres, settings, models, model_idx, last_tap):
+    """Render the settings screen at native fb size (no letterbox)."""
+    c = np.zeros((yres, xres, 3), dtype=np.uint8)
+    cv2.putText(c, "SETTINGS  (long-press = back)", (8, int(0.12 * yres)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+
+    rows = [
+        ("Threshold", f"< {settings['threshold']:.2f} >"),
+        ("Model", f"< {model_name(models[model_idx])} >"),
+        ("Auto-save", "ON" if settings["auto_save"] else "OFF"),
+        ("Show FPS", "ON" if settings["show_fps"] else "OFF"),
+    ]
+    row_h = (0.98 - ROW_TOP) / len(rows)
+    for i, (label, value) in enumerate(rows):
+        y1 = int((ROW_TOP + i * row_h) * yres)
+        y2 = int((ROW_TOP + (i + 1) * row_h) * yres) - 4
+        cv2.rectangle(c, (6, y1), (xres - 6, y2), (60, 60, 60), -1)
+        cv2.line(c, (xres // 2, y1), (xres // 2, y2), (90, 90, 90), 1)
+        ty = (y1 + y2) // 2 + 6
+        cv2.putText(c, label, (14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
+        (vw, _), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.putText(c, value, (xres - 14 - vw, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 220, 255), 1)
+
+    # Marker showing where the last tap landed (helps fix orientation flags)
+    if last_tap is not None:
+        mx, my = int(last_tap[0] * xres), int(last_tap[1] * yres)
+        cv2.circle(c, (mx, my), 9, (0, 165, 255), 2)
+    return c
+
+
+def settings_hit(nx, ny):
+    """Map a normalized tap to (row_index, side L/R), or (None, None)."""
+    if ny < ROW_TOP or ny > 0.98:
+        return None, None
+    row = int((ny - ROW_TOP) / ((0.98 - ROW_TOP) / len(SETTING_ROWS)))
+    row = min(row, len(SETTING_ROWS) - 1)
+    return row, ("L" if nx < 0.5 else "R")
+
+
+def apply_setting(row, side, settings, models, model_idx, reload_model):
+    """Adjust the given setting; returns possibly-updated model_idx."""
+    key = SETTING_ROWS[row]
+    if key == "threshold":
+        step = -0.05 if side == "L" else 0.05
+        settings["threshold"] = round(min(0.95, max(0.05, settings["threshold"] + step)), 2)
+    elif key == "model":
+        if len(models) > 1:
+            model_idx = (model_idx + (-1 if side == "L" else 1)) % len(models)
+            reload_model(models[model_idx])
+    elif key == "auto_save":
+        settings["auto_save"] = not settings["auto_save"]
+    elif key == "show_fps":
+        settings["show_fps"] = not settings["show_fps"]
+    return model_idx
+
+
+# ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
-    parser.add_argument("--fb", default="/dev/fb1", help="Framebuffer device (default /dev/fb1)")
-    parser.add_argument("--no-save", action="store_true", help="Do not save captured frames")
-    parser.add_argument("--conf", type=float, default=cd.CONFIDENCE_THRESHOLD,
-                        help=f"Confidence threshold (default {cd.CONFIDENCE_THRESHOLD})")
-    parser.add_argument("--touch", default=None, help="Touch input device (default: auto-detect)")
-    parser.add_argument("--no-touch", action="store_true", help="Disable touch, keyboard only")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
+    p.add_argument("--fb", default="/dev/fb1")
+    p.add_argument("--conf", type=float, default=cd.CONFIDENCE_THRESHOLD)
+    p.add_argument("--no-save", action="store_true")
+    p.add_argument("--touch", default=None, help="Touch device (default: auto-detect)")
+    p.add_argument("--no-touch", action="store_true")
+    p.add_argument("--swap-xy", action="store_true", help="Swap touch X/Y (rotated panels)")
+    p.add_argument("--flip-x", action="store_true")
+    p.add_argument("--flip-y", action="store_true")
+    p.add_argument("--touch-debug", action="store_true", help="Print tap coordinates")
+    args = p.parse_args()
 
     if not os.path.exists(args.fb):
         raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run lcd-on first.")
 
-    write_fb = make_fb_writer(args.fb)
+    write_fb, xres, yres = make_fb_writer(args.fb)
 
-    touch_fd = None if args.no_touch else open_touch(find_touch_device(args.touch))
+    touch = None
+    if not args.no_touch:
+        fd = open_touch(find_touch_device(args.touch))
+        if fd is not None:
+            touch = Touch(fd, args.swap_xy, args.flip_x, args.flip_y, args.touch_debug)
 
-    print(f"Loading model: {cd.MODEL_PATH}")
-    session = ort.InferenceSession(cd.MODEL_PATH)
+    # Model list (for the Model setting), like corrosion_detection.py
+    model_dir = os.path.dirname(cd.MODEL_PATH)
+    models = sorted(os.path.join(model_dir, f) for f in os.listdir(model_dir)
+                    if f.endswith(".onnx")) or [cd.MODEL_PATH]
+    model_idx = next((i for i, m in enumerate(models)
+                      if os.path.abspath(m) == os.path.abspath(cd.MODEL_PATH)), 0)
+
+    print(f"Loading model: {models[model_idx]}")
+    session = ort.InferenceSession(models[model_idx])
     input_name = session.get_inputs()[0].name
     print("Model loaded.")
+
+    def reload_model(path):
+        nonlocal session, input_name
+        try:
+            session = ort.InferenceSession(path)
+            input_name = session.get_inputs()[0].name
+            print(f"Model -> {model_name(path)}")
+        except Exception as e:
+            print(f"Failed to load {path}: {e}")
+
+    settings = {"threshold": args.conf, "auto_save": not args.no_save, "show_fps": False}
 
     picam2 = Picamera2()
     picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
     picam2.start()
     time.sleep(2)
     try:
-        picam2.set_controls({"AfMode": 2})  # continuous AF (Camera Module 3 only)
+        picam2.set_controls({"AfMode": 2})
     except Exception:
         pass
 
-    trig = "Tap/Enter" if touch_fd is not None else "Enter"
+    trig = "Tap/Enter" if touch else "Enter"
     print("\n=== Capture-on-demand (autoscan OFF) ===")
-    print(f"  {trig}      capture + detect / back to live")
-    print("  q + Enter  quit\n")
+    print(f"  {trig}            capture / back")
+    print("  long-press / s    open/close Settings")
+    print("  q + Enter         quit\n")
 
-    reviewing = False
-    last_touch = 0.0
+    state = "live"          # live | review | settings
+    last_tap = None
+    fps, fps_n, fps_t = 0, 0, time.time()
+
     try:
         while True:
-            quit_req, trigger, last_touch = poll_trigger(touch_fd, last_touch)
-            if quit_req:
+            # --- gather input (keyboard + touch), non-blocking ---
+            timeout = 0.0 if state == "live" else 0.08
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+            kbd = sys.stdin.readline().strip().lower() if r else None
+            gestures = touch.poll() if touch else []
+
+            if kbd == "q":
                 break
-            if trigger:
-                if not reviewing:
-                    # Capture + detect, then freeze the result on the LCD
-                    frame, boxes, analysis, infer_ms = capture_and_detect(
-                        picam2, session, input_name, args.conf)
-                    h = frame.shape[0]
-                    sev = analysis["severity"]
-                    cv2.putText(frame, f"{sev}  det:{len(boxes)}  {infer_ms:.0f}ms",
-                                (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                SEV_COLORS.get(sev, (255, 255, 255)), 2)
-                    if analysis.get("suspicious"):
-                        cv2.putText(frame, "! full-frame box", (8, h - 34),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
-                    cv2.putText(frame, f"{trig}=new  q=quit", (8, h - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    write_fb(frame)
+            kbd_enter = kbd is not None and kbd != "s" and kbd != "q"
+            kbd_settings = kbd == "s"
 
-                    print(f"Captured: severity {sev}, {len(boxes)} detection(s), {infer_ms:.0f}ms")
-                    if not args.no_save:
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        prefix = "corrosion" if boxes else "capture"
-                        path = os.path.join(cd.DETECTIONS_FOLDER, f"{prefix}_{ts}.jpg")
-                        cv2.imwrite(path, frame)
-                        print(f"Saved {path}")
-                    reviewing = True
+            # --- map inputs to actions for the current state ---
+            long_press = any(g[0] == "long" for g in gestures)
+            taps = [g for g in gestures if g[0] == "tap"]
+
+            if state == "settings":
+                if long_press or kbd_settings or kbd_enter:
+                    state = "live"
                 else:
-                    # Trigger while reviewing returns to live preview
-                    reviewing = False
+                    for _, nx, ny in taps:
+                        last_tap = (nx, ny)
+                        row, side = settings_hit(nx, ny)
+                        if row is not None:
+                            model_idx = apply_setting(row, side, settings, models, model_idx, reload_model)
+                c = draw_settings(xres, yres, settings, models, model_idx, last_tap)
+                write_fb(c)
+                continue
 
-            if not reviewing:
-                # LIVE preview (no inference)
-                rgb = picam2.capture_array()
-                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                cv2.putText(frame, f"LIVE  {trig}=capture", (8, 26),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+            if long_press or kbd_settings:
+                state = "settings"
+                last_tap = None
+                continue
+
+            triggered = bool(taps) or kbd_enter
+
+            if state == "review":
+                if triggered:
+                    state = "live"
+                else:
+                    time.sleep(0.03)
+                continue
+
+            # --- LIVE ---
+            if triggered:
+                frame, boxes, analysis, infer_ms = capture_and_detect(
+                    picam2, session, input_name, settings["threshold"])
+                h = frame.shape[0]
+                sev = analysis["severity"]
+                cv2.putText(frame, f"{sev}  det:{len(boxes)}  {infer_ms:.0f}ms",
+                            (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            SEV_COLORS.get(sev, (255, 255, 255)), 2)
+                if analysis.get("suspicious"):
+                    cv2.putText(frame, "! full-frame box", (8, h - 34),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+                cv2.putText(frame, f"{trig}=new  long=settings", (8, h - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 write_fb(frame)
-            else:
-                # Reviewing: hold the frozen result, just poll for input
-                time.sleep(0.03)
+                print(f"Captured: severity {sev}, {len(boxes)} detection(s), {infer_ms:.0f}ms")
+                if settings["auto_save"]:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    prefix = "corrosion" if boxes else "capture"
+                    path = os.path.join(cd.DETECTIONS_FOLDER, f"{prefix}_{ts}.jpg")
+                    cv2.imwrite(path, frame)
+                    print(f"Saved {path}")
+                state = "review"
+                continue
+
+            # live preview frame
+            rgb = picam2.capture_array()
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            fps_n += 1
+            if time.time() - fps_t >= 1.0:
+                fps, fps_n, fps_t = fps_n, 0, time.time()
+            cv2.putText(frame, f"LIVE  {trig}=capture", (8, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+            if settings["show_fps"]:
+                cv2.putText(frame, f"FPS: {fps}", (8, 52),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            write_fb(frame)
 
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
         picam2.stop()
-        if touch_fd is not None:
-            os.close(touch_fd)
+        if touch is not None:
+            os.close(touch.fd)
         print("Camera stopped.")
 
 
