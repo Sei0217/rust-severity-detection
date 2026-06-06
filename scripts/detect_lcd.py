@@ -249,33 +249,62 @@ def model_name(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
-def draw_settings(xres, yres, settings, models, model_idx, last_tap):
-    """Render the settings screen at native fb size (no letterbox)."""
-    c = np.zeros((yres, xres, 3), dtype=np.uint8)
-    cv2.putText(c, "SETTINGS  (long-press = back)", (8, int(0.12 * yres)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+def _centered(c, text, rect, scale, color, thick):
+    x1, y1, x2, y2 = rect
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    tx = x1 + ((x2 - x1) - tw) // 2
+    ty = y1 + ((y2 - y1) + th) // 2
+    cv2.putText(c, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
 
+
+def draw_settings(xres, yres, settings, models, model_idx, last_tap):
+    """Render the settings screen at native fb size (no letterbox).
+
+    Adjustable rows show tappable [-]/[+] (or [<]/[>]) edge buttons; the whole
+    left/right half is the actual hit zone. Toggle rows flip on any tap.
+    """
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    c = np.zeros((yres, xres, 3), dtype=np.uint8)
+    cv2.putText(c, "SETTINGS   (long-press = back)", (8, int(0.12 * yres)),
+                FONT, 0.5, (0, 255, 255), 1)
+
+    # key, label, value-string, left-btn, right-btn (None,None = toggle row)
     rows = [
-        ("Threshold", f"< {settings['threshold']:.2f} >"),
-        ("Model", f"< {model_name(models[model_idx])} >"),
-        ("Auto-save", "ON" if settings["auto_save"] else "OFF"),
-        ("Show FPS", "ON" if settings["show_fps"] else "OFF"),
+        ("threshold", "Threshold", f"{settings['threshold']:.2f}", "-", "+"),
+        ("model", "Model", model_name(models[model_idx]), "<", ">"),
+        ("auto_save", "Auto-save", "ON" if settings["auto_save"] else "OFF", None, None),
+        ("show_fps", "Show FPS", "ON" if settings["show_fps"] else "OFF", None, None),
     ]
     row_h = (0.98 - ROW_TOP) / len(rows)
-    for i, (label, value) in enumerate(rows):
+    bw = int(xres * 0.16)
+    for i, (_key, label, value, lbtn, rbtn) in enumerate(rows):
         y1 = int((ROW_TOP + i * row_h) * yres)
         y2 = int((ROW_TOP + (i + 1) * row_h) * yres) - 4
-        cv2.rectangle(c, (6, y1), (xres - 6, y2), (60, 60, 60), -1)
-        cv2.line(c, (xres // 2, y1), (xres // 2, y2), (90, 90, 90), 1)
-        ty = (y1 + y2) // 2 + 6
-        cv2.putText(c, label, (14, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
-        (vw, _), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.putText(c, value, (xres - 14 - vw, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 220, 255), 1)
+        cv2.rectangle(c, (6, y1), (xres - 6, y2), (45, 45, 45), -1)
+        cv2.rectangle(c, (6, y1), (xres - 6, y2), (90, 90, 90), 1)
 
-    # Marker showing where the last tap landed (helps fix orientation flags)
+        if lbtn:  # adjustable row: edge buttons + label/value in the middle
+            cv2.rectangle(c, (6, y1), (6 + bw, y2), (70, 35, 35), -1)
+            _centered(c, lbtn, (6, y1, 6 + bw, y2), 1.0, (170, 170, 255), 2)
+            cv2.rectangle(c, (xres - 6 - bw, y1), (xres - 6, y2), (35, 70, 35), -1)
+            _centered(c, rbtn, (xres - 6 - bw, y1, xres - 6, y2), 1.0, (170, 255, 170), 2)
+            cv2.putText(c, label, (6 + bw + 12, (y1 + y2) // 2 + 5),
+                        FONT, 0.5, (210, 210, 210), 1)
+            (vw, _), _ = cv2.getTextSize(value, FONT, 0.6, 2)
+            cv2.putText(c, value, (xres - 6 - bw - vw - 12, (y1 + y2) // 2 + 7),
+                        FONT, 0.6, (160, 220, 255), 2)
+        else:  # toggle row: label + colored ON/OFF pill, any tap flips it
+            on = value == "ON"
+            cv2.putText(c, label, (16, (y1 + y2) // 2 + 5), FONT, 0.5, (210, 210, 210), 1)
+            pill = (xres - 6 - bw, y1 + 6, xres - 6 - 6, y2 - 6)
+            cv2.rectangle(c, pill[:2], pill[2:], (0, 130, 0) if on else (60, 60, 60), -1)
+            _centered(c, value, pill, 0.6, (255, 255, 255), 2)
+            cv2.putText(c, "tap to toggle", (6 + bw, (y1 + y2) // 2 + 5),
+                        FONT, 0.4, (120, 120, 120), 1)
+
     if last_tap is not None:
         mx, my = int(last_tap[0] * xres), int(last_tap[1] * yres)
-        cv2.circle(c, (mx, my), 9, (0, 165, 255), 2)
+        cv2.circle(c, (mx, my), 8, (0, 165, 255), 2)
     return c
 
 
