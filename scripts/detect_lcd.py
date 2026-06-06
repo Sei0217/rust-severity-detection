@@ -283,24 +283,22 @@ def draw_settings(xres, yres, settings, models, model_idx, last_tap):
         cv2.rectangle(c, (6, y1), (xres - 6, y2), (45, 45, 45), -1)
         cv2.rectangle(c, (6, y1), (xres - 6, y2), (90, 90, 90), 1)
 
-        if lbtn:  # adjustable row: edge buttons + label/value in the middle
-            cv2.rectangle(c, (6, y1), (6 + bw, y2), (70, 35, 35), -1)
-            _centered(c, lbtn, (6, y1, 6 + bw, y2), 1.0, (170, 170, 255), 2)
-            cv2.rectangle(c, (xres - 6 - bw, y1), (xres - 6, y2), (35, 70, 35), -1)
-            _centered(c, rbtn, (xres - 6 - bw, y1, xres - 6, y2), 1.0, (170, 255, 170), 2)
-            cv2.putText(c, label, (6 + bw + 12, (y1 + y2) // 2 + 5),
+        if lbtn:  # adjustable row: same-colored edge buttons, label/value between
+            cv2.rectangle(c, (6, y1), (6 + bw, y2), (75, 75, 75), -1)
+            _centered(c, lbtn, (6, y1, 6 + bw, y2), 1.0, (255, 255, 255), 2)
+            cv2.rectangle(c, (xres - 6 - bw, y1), (xres - 6, y2), (75, 75, 75), -1)
+            _centered(c, rbtn, (xres - 6 - bw, y1, xres - 6, y2), 1.0, (255, 255, 255), 2)
+            cv2.putText(c, label, (6 + bw + 14, (y1 + y2) // 2 + 5),
                         FONT, 0.5, (210, 210, 210), 1)
             (vw, _), _ = cv2.getTextSize(value, FONT, 0.6, 2)
-            cv2.putText(c, value, (xres - 6 - bw - vw - 12, (y1 + y2) // 2 + 7),
+            cv2.putText(c, value, (xres - 6 - bw - vw - 14, (y1 + y2) // 2 + 7),
                         FONT, 0.6, (160, 220, 255), 2)
-        else:  # toggle row: label + colored ON/OFF pill, any tap flips it
+        else:  # toggle row: label on the left, colored ON/OFF pill on the right
             on = value == "ON"
             cv2.putText(c, label, (16, (y1 + y2) // 2 + 5), FONT, 0.5, (210, 210, 210), 1)
-            pill = (xres - 6 - bw, y1 + 6, xres - 6 - 6, y2 - 6)
-            cv2.rectangle(c, pill[:2], pill[2:], (0, 130, 0) if on else (60, 60, 60), -1)
+            pill = (xres - 6 - bw, y1 + 6, xres - 12, y2 - 6)
+            cv2.rectangle(c, pill[:2], pill[2:], (0, 140, 0) if on else (70, 70, 70), -1)
             _centered(c, value, pill, 0.6, (255, 255, 255), 2)
-            cv2.putText(c, "tap to toggle", (6 + bw, (y1 + y2) // 2 + 5),
-                        FONT, 0.4, (120, 120, 120), 1)
 
     if last_tap is not None:
         mx, my = int(last_tap[0] * xres), int(last_tap[1] * yres)
