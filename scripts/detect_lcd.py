@@ -68,7 +68,7 @@ BTN_TOUCH = 0x14a
 LONG_PRESS = 0.6          # seconds held = "long press"
 TOUCH_CAL_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_touch.json")
 
-SETTING_ROWS = ["threshold", "model", "auto_save", "show_fps"]
+SETTINGS_LAYOUT = ["threshold", "model", "auto_save", "show_fps", "gallery"]
 ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
 
 
@@ -268,22 +268,23 @@ def draw_settings(xres, yres, settings, models, model_idx, last_tap):
     cv2.putText(c, "SETTINGS   (long-press = back)", (8, int(0.12 * yres)),
                 FONT, 0.5, (0, 255, 255), 1)
 
-    # key, label, value-string, left-btn, right-btn (None,None = toggle row)
+    # kind, label, value-string, left-btn, right-btn
     rows = [
-        ("threshold", "Threshold", f"{settings['threshold']:.2f}", "-", "+"),
-        ("model", "Model", model_name(models[model_idx]), "<", ">"),
-        ("auto_save", "Auto-save", "ON" if settings["auto_save"] else "OFF", None, None),
-        ("show_fps", "Show FPS", "ON" if settings["show_fps"] else "OFF", None, None),
+        ("adjust", "Threshold", f"{settings['threshold']:.2f}", "-", "+"),
+        ("adjust", "Model", model_name(models[model_idx]), "<", ">"),
+        ("toggle", "Auto-save", "ON" if settings["auto_save"] else "OFF", None, None),
+        ("toggle", "Show FPS", "ON" if settings["show_fps"] else "OFF", None, None),
+        ("action", "Gallery", "view captures >", None, None),
     ]
     row_h = (0.98 - ROW_TOP) / len(rows)
     bw = int(xres * 0.16)
-    for i, (_key, label, value, lbtn, rbtn) in enumerate(rows):
+    for i, (kind, label, value, lbtn, rbtn) in enumerate(rows):
         y1 = int((ROW_TOP + i * row_h) * yres)
         y2 = int((ROW_TOP + (i + 1) * row_h) * yres) - 4
         cv2.rectangle(c, (6, y1), (xres - 6, y2), (45, 45, 45), -1)
         cv2.rectangle(c, (6, y1), (xres - 6, y2), (90, 90, 90), 1)
 
-        if lbtn:  # adjustable row: same-colored edge buttons, label/value between
+        if kind == "adjust":  # same-colored edge buttons, label/value between
             cv2.rectangle(c, (6, y1), (6 + bw, y2), (75, 75, 75), -1)
             _centered(c, lbtn, (6, y1, 6 + bw, y2), 1.0, (255, 255, 255), 2)
             cv2.rectangle(c, (xres - 6 - bw, y1), (xres - 6, y2), (75, 75, 75), -1)
@@ -293,12 +294,15 @@ def draw_settings(xres, yres, settings, models, model_idx, last_tap):
             (vw, _), _ = cv2.getTextSize(value, FONT, 0.6, 2)
             cv2.putText(c, value, (xres - 6 - bw - vw - 14, (y1 + y2) // 2 + 7),
                         FONT, 0.6, (160, 220, 255), 2)
-        else:  # toggle row: label on the left, colored ON/OFF pill on the right
+        elif kind == "toggle":  # label left, colored ON/OFF pill right
             on = value == "ON"
             cv2.putText(c, label, (16, (y1 + y2) // 2 + 5), FONT, 0.5, (210, 210, 210), 1)
             pill = (xres - 6 - bw, y1 + 6, xres - 12, y2 - 6)
             cv2.rectangle(c, pill[:2], pill[2:], (0, 140, 0) if on else (70, 70, 70), -1)
             _centered(c, value, pill, 0.6, (255, 255, 255), 2)
+        else:  # action row (Gallery): full-width button, tap anywhere
+            cv2.rectangle(c, (6, y1), (xres - 6, y2), (55, 55, 80), -1)
+            _centered(c, f"{label}    {value}", (6, y1, xres - 6, y2), 0.55, (200, 220, 255), 1)
 
     if last_tap is not None:
         mx, my = int(last_tap[0] * xres), int(last_tap[1] * yres)
@@ -310,14 +314,13 @@ def settings_hit(nx, ny):
     """Map a normalized tap to (row_index, side L/R), or (None, None)."""
     if ny < ROW_TOP or ny > 0.98:
         return None, None
-    row = int((ny - ROW_TOP) / ((0.98 - ROW_TOP) / len(SETTING_ROWS)))
-    row = min(row, len(SETTING_ROWS) - 1)
+    row = int((ny - ROW_TOP) / ((0.98 - ROW_TOP) / len(SETTINGS_LAYOUT)))
+    row = min(row, len(SETTINGS_LAYOUT) - 1)
     return row, ("L" if nx < 0.5 else "R")
 
 
-def apply_setting(row, side, settings, models, model_idx, reload_model):
-    """Adjust the given setting; returns possibly-updated model_idx."""
-    key = SETTING_ROWS[row]
+def apply_setting(key, side, settings, models, model_idx, reload_model):
+    """Adjust the setting named `key`; returns possibly-updated model_idx."""
     if key == "threshold":
         step = -0.05 if side == "L" else 0.05
         settings["threshold"] = round(min(0.95, max(0.05, settings["threshold"] + step)), 2)
@@ -330,6 +333,42 @@ def apply_setting(row, side, settings, models, model_idx, reload_model):
     elif key == "show_fps":
         settings["show_fps"] = not settings["show_fps"]
     return model_idx
+
+
+# ----------------------------------------------------------------------------
+# Gallery (browse saved captures)
+# ----------------------------------------------------------------------------
+def load_gallery():
+    """Return saved capture image paths, newest first (timestamped names sort)."""
+    try:
+        files = [os.path.join(cd.DETECTIONS_FOLDER, f)
+                 for f in os.listdir(cd.DETECTIONS_FOLDER)
+                 if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    except OSError:
+        return []
+    files.sort(reverse=True)
+    return files
+
+
+def render_gallery(write_fb, xres, yres, files, idx):
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    if not files:
+        c = np.zeros((yres, xres, 3), dtype=np.uint8)
+        _centered(c, "No captures yet", (0, 0, xres, yres), 0.7, (200, 200, 200), 2)
+        _centered(c, "long-press = back", (0, int(yres * 0.7), xres, yres), 0.5, (0, 255, 255), 1)
+        write_fb(c)
+        return
+    img = cv2.imread(files[idx])
+    if img is None:
+        img = np.zeros((yres, xres, 3), dtype=np.uint8)
+        _centered(img, "cannot read image", (0, 0, xres, yres), 0.6, (0, 0, 255), 2)
+    h, w = img.shape[:2]
+    cv2.rectangle(img, (0, 0), (w, 26), (0, 0, 0), -1)
+    cv2.putText(img, f"{idx + 1}/{len(files)}  {os.path.basename(files[idx])}",
+                (6, 18), FONT, 0.5, (0, 255, 255), 1)
+    cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
+    cv2.putText(img, "< prev    next >    long = back", (6, h - 8), FONT, 0.5, (0, 255, 255), 1)
+    write_fb(img)
 
 
 # ----------------------------------------------------------------------------
@@ -471,11 +510,12 @@ def main():
     trig = "Tap/Enter" if touch else "Enter"
     print("\n=== Capture-on-demand (autoscan OFF) ===")
     print(f"  {trig}            capture / back")
-    print("  long-press / s    open/close Settings")
+    print("  long-press / s    open/close Settings (Gallery is a row there)")
     print("  q + Enter         quit\n")
 
-    state = "live"          # live | review | settings
+    state = "live"          # live | review | settings | gallery
     last_tap = None
+    gallery_files, gallery_idx, gallery_drawn = [], 0, -1
     fps, fps_n, fps_t = 0, 0, time.time()
 
     try:
@@ -502,10 +542,36 @@ def main():
                     for _, nx, ny in taps:
                         last_tap = (nx, ny)
                         row, side = settings_hit(nx, ny)
-                        if row is not None:
-                            model_idx = apply_setting(row, side, settings, models, model_idx, reload_model)
-                c = draw_settings(xres, yres, settings, models, model_idx, last_tap)
-                write_fb(c)
+                        if row is None:
+                            continue
+                        key = SETTINGS_LAYOUT[row]
+                        if key == "gallery":
+                            gallery_files = load_gallery()
+                            gallery_idx, gallery_drawn = 0, -1
+                            state = "gallery"
+                            break
+                        model_idx = apply_setting(key, side, settings, models, model_idx, reload_model)
+                if state == "settings":
+                    write_fb(draw_settings(xres, yres, settings, models, model_idx, last_tap))
+                continue
+
+            if state == "gallery":
+                if long_press or kbd_settings:
+                    state = "live"
+                    continue
+                if taps:
+                    nx, ny = taps[-1][1], taps[-1][2]
+                    last_tap = (nx, ny)
+                    gallery_idx += -1 if nx < 0.5 else 1
+                elif kbd_enter:
+                    gallery_idx += 1
+                if gallery_files:
+                    gallery_idx %= len(gallery_files)
+                if gallery_idx != gallery_drawn:
+                    render_gallery(write_fb, xres, yres, gallery_files, gallery_idx)
+                    gallery_drawn = gallery_idx
+                else:
+                    time.sleep(0.08)
                 continue
 
             if long_press or kbd_settings:
