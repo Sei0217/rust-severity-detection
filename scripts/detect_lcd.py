@@ -350,25 +350,54 @@ def load_gallery():
     return files
 
 
-def render_gallery(write_fb, xres, yres, files, idx):
+GALLERY_BAR = 0.86        # bottom toolbar occupies ny in [GALLERY_BAR, 1.0]
+
+
+def render_gallery(write_fb, xres, yres, files, idx, confirm=False):
+    """Draw the gallery at native fb size (no letterbox) so tap-zones map directly.
+    Bottom toolbar: [< Prev] [DELETE] [Next >]. confirm shows a Cancel/Delete overlay."""
     FONT = cv2.FONT_HERSHEY_SIMPLEX
+    c = np.zeros((yres, xres, 3), dtype=np.uint8)
     if not files:
-        c = np.zeros((yres, xres, 3), dtype=np.uint8)
         _centered(c, "No captures yet", (0, 0, xres, yres), 0.7, (200, 200, 200), 2)
         _centered(c, "long-press = back", (0, int(yres * 0.7), xres, yres), 0.5, (0, 255, 255), 1)
         write_fb(c)
         return
+
     img = cv2.imread(files[idx])
-    if img is None:
-        img = np.zeros((yres, xres, 3), dtype=np.uint8)
-        _centered(img, "cannot read image", (0, 0, xres, yres), 0.6, (0, 0, 255), 2)
-    h, w = img.shape[:2]
-    cv2.rectangle(img, (0, 0), (w, 26), (0, 0, 0), -1)
-    cv2.putText(img, f"{idx + 1}/{len(files)}  {os.path.basename(files[idx])}",
-                (6, 18), FONT, 0.5, (0, 255, 255), 1)
-    cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
-    cv2.putText(img, "< prev    next >    long = back", (6, h - 8), FONT, 0.5, (0, 255, 255), 1)
-    write_fb(img)
+    if img is not None:
+        c = letterbox(img, xres, yres)
+    else:
+        _centered(c, "cannot read image", (0, 0, xres, yres), 0.6, (0, 0, 255), 2)
+
+    # top bar: index + filename
+    cv2.rectangle(c, (0, 0), (xres, 24), (0, 0, 0), -1)
+    cv2.putText(c, f"{idx + 1}/{len(files)}  {os.path.basename(files[idx])}",
+                (6, 17), FONT, 0.45, (0, 255, 255), 1)
+
+    # bottom toolbar with three zones
+    by = int(yres * GALLERY_BAR)
+    t = xres // 3
+    cv2.rectangle(c, (0, by), (xres, yres), (0, 0, 0), -1)
+    _centered(c, "< Prev", (0, by, t, yres), 0.5, (0, 255, 255), 1)
+    _centered(c, "DELETE", (t, by, 2 * t, yres), 0.55, (80, 120, 255), 2)
+    _centered(c, "Next >", (2 * t, by, xres, yres), 0.5, (0, 255, 255), 1)
+    cv2.line(c, (t, by), (t, yres), (80, 80, 80), 1)
+    cv2.line(c, (2 * t, by), (2 * t, yres), (80, 80, 80), 1)
+
+    if confirm:
+        ov = c.copy()
+        cv2.rectangle(ov, (0, 0), (xres, yres), (0, 0, 0), -1)
+        cv2.addWeighted(ov, 0.6, c, 0.4, 0, c)
+        _centered(c, "Delete this capture?", (0, int(yres * 0.26), xres, int(yres * 0.44)),
+                  0.65, (255, 255, 255), 2)
+        y1b, y2b = int(yres * 0.52), int(yres * 0.74)
+        cv2.rectangle(c, (int(xres * 0.08), y1b), (int(xres * 0.46), y2b), (70, 70, 70), -1)
+        _centered(c, "Cancel", (int(xres * 0.08), y1b, int(xres * 0.46), y2b), 0.6, (255, 255, 255), 2)
+        cv2.rectangle(c, (int(xres * 0.54), y1b), (int(xres * 0.92), y2b), (0, 0, 170), -1)
+        _centered(c, "Delete", (int(xres * 0.54), y1b, int(xres * 0.92), y2b), 0.6, (255, 255, 255), 2)
+
+    write_fb(c)
 
 
 # ----------------------------------------------------------------------------
@@ -515,7 +544,8 @@ def main():
 
     state = "live"          # live | review | settings | gallery
     last_tap = None
-    gallery_files, gallery_idx, gallery_drawn = [], 0, -1
+    gallery_files, gallery_idx = [], 0
+    gallery_confirm, gallery_dirty = False, False
     fps, fps_n, fps_t = 0, 0, time.time()
 
     try:
@@ -547,7 +577,7 @@ def main():
                         key = SETTINGS_LAYOUT[row]
                         if key == "gallery":
                             gallery_files = load_gallery()
-                            gallery_idx, gallery_drawn = 0, -1
+                            gallery_idx, gallery_confirm, gallery_dirty = 0, False, True
                             state = "gallery"
                             break
                         model_idx = apply_setting(key, side, settings, models, model_idx, reload_model)
@@ -558,18 +588,55 @@ def main():
             if state == "gallery":
                 if long_press or kbd_settings:
                     state = "live"
+                    gallery_confirm = False
                     continue
-                if taps:
-                    nx, ny = taps[-1][1], taps[-1][2]
-                    last_tap = (nx, ny)
-                    gallery_idx += -1 if nx < 0.5 else 1
-                elif kbd_enter:
-                    gallery_idx += 1
-                if gallery_files:
-                    gallery_idx %= len(gallery_files)
-                if gallery_idx != gallery_drawn:
-                    render_gallery(write_fb, xres, yres, gallery_files, gallery_idx)
-                    gallery_drawn = gallery_idx
+
+                if gallery_confirm:
+                    decided = None
+                    if taps:
+                        nx, ny = taps[-1][1], taps[-1][2]
+                        last_tap = (nx, ny)
+                        decided = "delete" if nx >= 0.5 else "cancel"
+                    elif kbd is not None:
+                        decided = "delete" if kbd in ("y", "d") else "cancel"
+                    if decided is not None:
+                        if decided == "delete" and gallery_files:
+                            try:
+                                os.remove(gallery_files[gallery_idx])
+                                print(f"Deleted {gallery_files[gallery_idx]}")
+                            except OSError as e:
+                                print(f"Delete failed: {e}")
+                            gallery_files = load_gallery()
+                            if gallery_idx >= len(gallery_files):
+                                gallery_idx = max(0, len(gallery_files) - 1)
+                        gallery_confirm = False
+                        gallery_dirty = True
+                else:
+                    if taps:
+                        nx, ny = taps[-1][1], taps[-1][2]
+                        last_tap = (nx, ny)
+                        if ny > GALLERY_BAR:                 # bottom toolbar
+                            if nx < 1 / 3:
+                                gallery_idx -= 1
+                            elif nx < 2 / 3:
+                                gallery_confirm = True
+                            else:
+                                gallery_idx += 1
+                        else:                               # image area
+                            gallery_idx += -1 if nx < 0.5 else 1
+                        gallery_dirty = True
+                    elif kbd == "d":
+                        gallery_confirm = True
+                        gallery_dirty = True
+                    elif kbd is not None:
+                        gallery_idx += 1
+                        gallery_dirty = True
+                    if gallery_files:
+                        gallery_idx %= len(gallery_files)
+
+                if gallery_dirty:
+                    render_gallery(write_fb, xres, yres, gallery_files, gallery_idx, gallery_confirm)
+                    gallery_dirty = False
                 else:
                     time.sleep(0.08)
                 continue
