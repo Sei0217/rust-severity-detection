@@ -70,6 +70,7 @@ TOUCH_CAL_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_touch.json")
 
 SETTINGS_LAYOUT = ["threshold", "model", "auto_save", "show_fps", "gallery"]
 ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
+ZOOM_LEVELS = [1.0, 2.0, 4.0]   # digital zoom factors cycled by the live button
 
 
 # ----------------------------------------------------------------------------
@@ -247,6 +248,45 @@ def capture_and_detect(picam2, session, input_name, conf):
 
 def model_name(path):
     return os.path.splitext(os.path.basename(path))[0]
+
+
+# ----------------------------------------------------------------------------
+# Digital zoom (ScalerCrop) — centered crop of the sensor, scaled by the ISP
+# ----------------------------------------------------------------------------
+def get_full_crop(picam2):
+    """Full usable sensor rectangle (x, y, w, h) for ScalerCrop."""
+    props = picam2.camera_properties
+    rect = props.get("ScalerCropMaximum")
+    if rect and rect[2] > 0 and rect[3] > 0:
+        return tuple(int(v) for v in rect)
+    size = props.get("PixelArraySize")
+    if size:
+        return (0, 0, int(size[0]), int(size[1]))
+    return (0, 0, 3280, 2464)  # IMX219 / Camera Module 2 fallback
+
+
+def apply_zoom(picam2, factor, full_rect):
+    """Set a centered ScalerCrop for the given zoom factor (1.0 = full frame)."""
+    fx, fy, fw, fh = full_rect
+    cw, ch = int(fw / factor), int(fh / factor)
+    cx = fx + (fw - cw) // 2
+    cy = fy + (fh - ch) // 2
+    try:
+        picam2.set_controls({"ScalerCrop": (cx, cy, cw, ch)})
+    except Exception as e:
+        print(f"Zoom set failed: {e}")
+
+
+def draw_zoom_button(frame, factor):
+    """Small circular zoom indicator/button at the bottom-center of the frame."""
+    h, w = frame.shape[:2]
+    cx, cy, r = w // 2, int(h * 0.90), 20
+    cv2.circle(frame, (cx, cy), r, (40, 40, 40), -1)
+    cv2.circle(frame, (cx, cy), r, (220, 220, 220), 1)
+    label = f"{factor:g}x"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    cv2.putText(frame, label, (cx - tw // 2, cy + th // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
 
 def _centered(c, text, rect, scale, color, thick):
@@ -536,6 +576,10 @@ def main():
     except Exception:
         pass
 
+    full_crop = get_full_crop(picam2)
+    zoom_idx = 0
+    apply_zoom(picam2, ZOOM_LEVELS[zoom_idx], full_crop)
+
     trig = "Tap/Enter" if touch else "Enter"
     print("\n=== Capture-on-demand (autoscan OFF) ===")
     print(f"  {trig}            capture / back")
@@ -656,7 +700,17 @@ def main():
                 continue
 
             # --- LIVE ---
-            if triggered:
+            do_cap = kbd_enter
+            if taps:
+                nx, ny = taps[-1][1], taps[-1][2]
+                last_tap = (nx, ny)
+                if ny > 0.85 and 0.40 < nx < 0.60:          # bottom-center zoom button
+                    zoom_idx = (zoom_idx + 1) % len(ZOOM_LEVELS)
+                    apply_zoom(picam2, ZOOM_LEVELS[zoom_idx], full_crop)
+                else:
+                    do_cap = True
+
+            if do_cap:
                 frame, boxes, analysis, infer_ms = capture_and_detect(
                     picam2, session, input_name, settings["threshold"])
                 h = frame.shape[0]
@@ -691,6 +745,7 @@ def main():
             if settings["show_fps"]:
                 cv2.putText(frame, f"FPS: {fps}", (8, 52),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            draw_zoom_button(frame, ZOOM_LEVELS[zoom_idx])
             write_fb(frame)
 
     except KeyboardInterrupt:
