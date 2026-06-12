@@ -3,5 +3,8 @@ calibration_images/
 quantization/
 training/
 all_rust_conversion/
+detections/
+models/development/
+segmentation/training/
 .env
 *.env
