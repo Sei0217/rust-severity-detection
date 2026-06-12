@@ -6,5 +6,6 @@ all_rust_conversion/
 detections/
 models/development/
 segmentation/training/
+runs/
 .env
 *.env
