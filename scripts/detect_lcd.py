@@ -541,6 +541,9 @@ def main():
     p.add_argument("--touch-debug", action="store_true", help="Print tap coordinates")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
                    help="Rotate the camera image in software (for a physically angled camera)")
+    p.add_argument("--threads", type=int, default=0,
+                   help="Cap ONNX Runtime threads to flatten the inference power spike "
+                        "(0=default/all cores; try 2 on a weak power supply)")
     p.add_argument("--calibrate", action="store_true",
                    help="Run 2-tap touch calibration (with your --flip/--swap flags) and save it")
     args = p.parse_args()
@@ -584,15 +587,22 @@ def main():
     model_idx = next((i for i, m in enumerate(models)
                       if os.path.abspath(m) == os.path.abspath(cd.MODEL_PATH)), 0)
 
+    def make_session(path):
+        so = ort.SessionOptions()
+        if args.threads and args.threads > 0:
+            so.intra_op_num_threads = args.threads
+            so.inter_op_num_threads = args.threads
+        return ort.InferenceSession(path, sess_options=so)
+
     print(f"Loading model: {models[model_idx]}")
-    session = ort.InferenceSession(models[model_idx])
+    session = make_session(models[model_idx])
     input_name = session.get_inputs()[0].name
-    print("Model loaded.")
+    print(f"Model loaded (threads={args.threads or 'default'}).")
 
     def reload_model(path):
         nonlocal session, input_name
         try:
-            session = ort.InferenceSession(path)
+            session = make_session(path)
             input_name = session.get_inputs()[0].name
             print(f"Model -> {model_name(path)}")
         except Exception as e:
