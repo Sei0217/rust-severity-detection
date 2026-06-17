@@ -227,8 +227,20 @@ def open_touch(path):
 # ----------------------------------------------------------------------------
 # Detection + drawing
 # ----------------------------------------------------------------------------
-def capture_and_detect(picam2, session, input_name, conf):
+ROTATE_OPS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+              270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def rotate_frame(img, deg):
+    """Rotate a captured frame 0/90/180/270 deg in software (angled camera)."""
+    op = ROTATE_OPS.get(deg)
+    return cv2.rotate(img, op) if op is not None else img
+
+
+def capture_and_detect(picam2, session, input_name, conf, rotate=0):
     rgb = picam2.capture_array()
+    if rotate:
+        rgb = rotate_frame(rgb, rotate)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = rgb.shape[:2]
     inp, scale, pad_top, pad_left = cd.preprocess_image(rgb, cd.INPUT_SIZE)
@@ -527,6 +539,8 @@ def main():
     p.add_argument("--flip-x", action="store_true")
     p.add_argument("--flip-y", action="store_true")
     p.add_argument("--touch-debug", action="store_true", help="Print tap coordinates")
+    p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                   help="Rotate the camera image in software (for a physically angled camera)")
     p.add_argument("--calibrate", action="store_true",
                    help="Run 2-tap touch calibration (with your --flip/--swap flags) and save it")
     args = p.parse_args()
@@ -757,7 +771,7 @@ def main():
 
             if do_cap:
                 frame, boxes, analysis, infer_ms = capture_and_detect(
-                    picam2, session, input_name, settings["threshold"])
+                    picam2, session, input_name, settings["threshold"], args.rotate)
                 h = frame.shape[0]
                 sev = analysis["severity"]
                 cv2.putText(frame, f"{sev}  det:{len(boxes)}  {infer_ms:.0f}ms",
@@ -781,6 +795,8 @@ def main():
 
             # live preview frame
             rgb = picam2.capture_array()
+            if args.rotate:
+                rgb = rotate_frame(rgb, args.rotate)
             frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             fps_n += 1
             if time.time() - fps_t >= 1.0:
