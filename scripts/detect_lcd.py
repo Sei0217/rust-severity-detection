@@ -68,7 +68,7 @@ BTN_TOUCH = 0x14a
 LONG_PRESS = 0.6          # seconds held = "long press"
 TOUCH_CAL_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_touch.json")
 
-SETTINGS_LAYOUT = ["threshold", "model", "auto_save", "show_fps", "gallery"]
+SETTINGS_LAYOUT = ["threshold", "model", "auto_save", "show_fps", "gallery", "shutdown"]
 ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
 ZOOM_LEVELS = [1.0, 2.0, 4.0]   # digital zoom factors cycled by the live button
 
@@ -315,6 +315,7 @@ def draw_settings(xres, yres, settings, models, model_idx, last_tap):
         ("toggle", "Auto-save", "ON" if settings["auto_save"] else "OFF", None, None),
         ("toggle", "Show FPS", "ON" if settings["show_fps"] else "OFF", None, None),
         ("action", "Gallery", "view captures >", None, None),
+        ("action", "Shutdown", "power off Pi >", None, None),
     ]
     row_h = (0.98 - ROW_TOP) / len(rows)
     bw = int(xres * 0.16)
@@ -340,13 +341,31 @@ def draw_settings(xres, yres, settings, models, model_idx, last_tap):
             pill = (xres - 6 - bw, y1 + 6, xres - 12, y2 - 6)
             cv2.rectangle(c, pill[:2], pill[2:], (0, 140, 0) if on else (70, 70, 70), -1)
             _centered(c, value, pill, 0.6, (255, 255, 255), 2)
-        else:  # action row (Gallery): full-width button, tap anywhere
-            cv2.rectangle(c, (6, y1), (xres - 6, y2), (55, 55, 80), -1)
-            _centered(c, f"{label}    {value}", (6, y1, xres - 6, y2), 0.55, (200, 220, 255), 1)
+        else:  # action row (Gallery / Shutdown): full-width button, tap anywhere
+            danger = label == "Shutdown"
+            bg = (0, 0, 90) if danger else (55, 55, 80)
+            fg = (170, 170, 255) if danger else (200, 220, 255)
+            cv2.rectangle(c, (6, y1), (xres - 6, y2), bg, -1)
+            _centered(c, f"{label}    {value}", (6, y1, xres - 6, y2), 0.55, fg, 1)
 
     if last_tap is not None:
         mx, my = int(last_tap[0] * xres), int(last_tap[1] * yres)
         cv2.circle(c, (mx, my), 8, (0, 165, 255), 2)
+    return c
+
+
+def draw_confirm(xres, yres, title, action_label):
+    """Full-screen confirm at native fb size. Left half = Cancel, right half =
+    `action_label`. If action_label is None, just show the title (e.g. status)."""
+    c = np.zeros((yres, xres, 3), dtype=np.uint8)
+    _centered(c, title, (0, int(yres * 0.16), xres, int(yres * 0.40)), 0.7, (255, 255, 255), 2)
+    if action_label is None:
+        return c
+    y1b, y2b = int(yres * 0.50), int(yres * 0.76)
+    cv2.rectangle(c, (int(xres * 0.08), y1b), (int(xres * 0.46), y2b), (70, 70, 70), -1)
+    _centered(c, "Cancel", (int(xres * 0.08), y1b, int(xres * 0.46), y2b), 0.6, (255, 255, 255), 2)
+    cv2.rectangle(c, (int(xres * 0.54), y1b), (int(xres * 0.92), y2b), (0, 0, 170), -1)
+    _centered(c, action_label, (int(xres * 0.54), y1b, int(xres * 0.92), y2b), 0.6, (255, 255, 255), 2)
     return c
 
 
@@ -590,6 +609,7 @@ def main():
     last_tap = None
     gallery_files, gallery_idx = [], 0
     gallery_confirm, gallery_dirty = False, False
+    shutdown_confirm = False
     fps, fps_n, fps_t = 0, 0, time.time()
 
     try:
@@ -610,6 +630,25 @@ def main():
             taps = [g for g in gestures if g[0] == "tap"]
 
             if state == "settings":
+                if shutdown_confirm:
+                    # confirm sub-screen: tap right half / 'y' = power off, else cancel
+                    decided = None
+                    if taps:
+                        nx, ny = taps[-1][1], taps[-1][2]
+                        last_tap = (nx, ny)
+                        decided = "yes" if nx >= 0.5 else "no"
+                    elif kbd is not None:
+                        decided = "yes" if kbd in ("y", "d") else "no"
+                    if decided == "yes":
+                        write_fb(draw_confirm(xres, yres, "Shutting down...", None))
+                        os.system("sudo shutdown -h now")
+                        break
+                    if decided == "no":
+                        shutdown_confirm = False
+                        write_fb(draw_settings(xres, yres, settings, models, model_idx, last_tap))
+                    else:
+                        write_fb(draw_confirm(xres, yres, "Shut down the Pi?", "Shutdown"))
+                    continue
                 if long_press or kbd_settings or kbd_enter:
                     state = "live"
                 else:
@@ -624,9 +663,15 @@ def main():
                             gallery_idx, gallery_confirm, gallery_dirty = 0, False, True
                             state = "gallery"
                             break
+                        if key == "shutdown":
+                            shutdown_confirm = True
+                            break
                         model_idx = apply_setting(key, side, settings, models, model_idx, reload_model)
                 if state == "settings":
-                    write_fb(draw_settings(xres, yres, settings, models, model_idx, last_tap))
+                    if shutdown_confirm:
+                        write_fb(draw_confirm(xres, yres, "Shut down the Pi?", "Shutdown"))
+                    else:
+                        write_fb(draw_settings(xres, yres, settings, models, model_idx, last_tap))
                 continue
 
             if state == "gallery":
