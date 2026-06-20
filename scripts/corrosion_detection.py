@@ -4,6 +4,7 @@ import onnxruntime as ort
 from picamera2 import Picamera2
 import time
 import json
+import threading
 from datetime import datetime
 import os
 from severity import analyze_rust
@@ -47,17 +48,29 @@ CLASS_COLORS = {
 
 def upload_to_website(annotated_bgr, boxes, scores, class_ids,
                       severity, blur_score, inference_time_s):
-    """POST an annotated capture + detection metadata to the Flask website.
+    """Fire-and-forget upload to the Flask website.
 
-    Best-effort: any network/encoding error is caught and printed so a failed
-    upload never interrupts capturing. The local save still happens regardless.
+    Runs in a background thread so a slow or unreachable server never freezes the
+    capture loop — and therefore never freezes the LCD or the live stream. Any
+    error is handled inside the worker; the local save has already happened.
     """
     if not UPLOAD_ENABLED:
         return
     if requests is None:
         print("⚠ Upload skipped: 'requests' not installed (run: pip install requests)")
         return
+    # Copy the frame so the worker is isolated from later drawing on the buffer.
+    threading.Thread(
+        target=_do_upload,
+        args=(annotated_bgr.copy(), list(boxes), list(scores), list(class_ids),
+              severity, blur_score, inference_time_s),
+        daemon=True,
+    ).start()
 
+
+def _do_upload(annotated_bgr, boxes, scores, class_ids,
+               severity, blur_score, inference_time_s):
+    """Worker thread: encode + POST. Best-effort; never raises to the caller."""
     try:
         # Encode the annotated frame to JPEG in memory (no temp file needed)
         ok, buf = cv2.imencode(".jpg", annotated_bgr)
