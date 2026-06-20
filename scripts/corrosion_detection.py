@@ -3,15 +3,32 @@ import numpy as np
 import onnxruntime as ort
 from picamera2 import Picamera2
 import time
+import json
 from datetime import datetime
 import os
 from severity import analyze_rust
+
+# 'requests' is only needed for uploading to the website. Import is guarded so the
+# detector still runs on a Pi where requests isn't installed (pip install requests).
+try:
+    import requests
+except ImportError:
+    requests = None
 
 # Configuration
 MODEL_PATH = "../models/best.onnx"
 DETECTIONS_FOLDER = "../detections"
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
+
+# --- Website upload (RPi5 → Flask site) ---
+# Point this at the PC running the website, on the SAME Wi-Fi/LAN as the Pi.
+# Find that PC's IPv4 address with `ipconfig` (Windows) / `hostname -I` (Linux),
+# e.g. http://192.168.1.50:5000  — or set the RUSTWATCH_SERVER env var to override.
+WEBSITE_URL     = os.environ.get("RUSTWATCH_SERVER", "http://192.168.1.100:5000")
+UPLOAD_ENDPOINT = WEBSITE_URL.rstrip("/") + "/upload-rpi5"
+UPLOAD_ENABLED  = True   # set False to disable network upload entirely
+UPLOAD_TIMEOUT  = 10     # seconds before giving up on the POST
 
 # Create detections folder
 os.makedirs(DETECTIONS_FOLDER, exist_ok=True)
@@ -26,6 +43,59 @@ CLASS_COLORS = {
     "medium": (0, 200, 255),   # amber
     "low":    (0, 200,   0),   # green
 }
+
+
+def upload_to_website(annotated_bgr, boxes, scores, class_ids,
+                      severity, blur_score, inference_time_s):
+    """POST an annotated capture + detection metadata to the Flask website.
+
+    Best-effort: any network/encoding error is caught and printed so a failed
+    upload never interrupts capturing. The local save still happens regardless.
+    """
+    if not UPLOAD_ENABLED:
+        return
+    if requests is None:
+        print("⚠ Upload skipped: 'requests' not installed (run: pip install requests)")
+        return
+
+    try:
+        # Encode the annotated frame to JPEG in memory (no temp file needed)
+        ok, buf = cv2.imencode(".jpg", annotated_bgr)
+        if not ok:
+            print("⚠ Upload skipped: could not encode image")
+            return
+
+        # Shape detections the way /upload-rpi5 expects: class / confidence / bbox.
+        # NOTE: postprocess_detections() returns boxes as [x, y, w, h]; the website
+        # stores bbox as corner coords, so convert to [x1, y1, x2, y2] here.
+        detections = []
+        for box, score, cls_id in zip(boxes, scores, class_ids):
+            x, y, w, h = (float(v) for v in box)
+            detections.append({
+                "class":      CLASS_NAMES[int(cls_id)].title(),   # high → High
+                "confidence": round(float(score) * 100, 2),       # 0..1 → percent
+                "bbox":       [x, y, x + w, y + h],               # [x1, y1, x2, y2]
+            })
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        files = {"file": (f"rpi5_{timestamp}.jpg", buf.tobytes(), "image/jpeg")}
+        data = {
+            "detections":     json.dumps(detections),
+            "severity_level": severity,                           # NONE/LOW/MEDIUM/HIGH
+            "blur_score":     f"{blur_score:.2f}",
+            "inference_time": f"{inference_time_s * 1000:.2f}",   # seconds → ms
+            "model":          os.path.splitext(os.path.basename(MODEL_PATH))[0] or "YOLOv8n-ONNX",
+        }
+
+        print(f"↑ Uploading to {UPLOAD_ENDPOINT} ...")
+        resp = requests.post(UPLOAD_ENDPOINT, files=files, data=data, timeout=UPLOAD_TIMEOUT)
+        if resp.status_code == 200:
+            info = resp.json()
+            print(f"✓ Uploaded to website (inspection #{info.get('inspection_id')})")
+        else:
+            print(f"⚠ Upload failed: HTTP {resp.status_code} — {resp.text[:200]}")
+    except Exception as e:
+        print(f"⚠ Upload error (capture still saved locally): {e}")
 
 # Settings panel definition: (settings_key, display_label)
 SETTING_LABELS = [

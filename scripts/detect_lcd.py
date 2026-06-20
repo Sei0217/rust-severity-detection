@@ -44,8 +44,10 @@ import os
 import select
 import struct
 import sys
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
@@ -255,7 +257,9 @@ def capture_and_detect(picam2, session, input_name, conf, rotate=0):
         frame = cd.draw_detections(frame, boxes, scores, ids)
     det_dicts = [{"bbox": b, "class": cd.CLASS_NAMES[c]} for b, c in zip(boxes, ids)]
     analysis = cd.analyze_rust(det_dicts, (h, w))
-    return frame, boxes, analysis, infer_ms
+    # Blur score: Laplacian variance on the raw capture — low value = blurry
+    blur_score = cv2.Laplacian(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+    return frame, boxes, scores, ids, analysis, infer_ms, blur_score
 
 
 def model_name(path):
@@ -528,6 +532,85 @@ def run_calibration(touch, write_fb, xres, yres):
 
 
 # ----------------------------------------------------------------------------
+# Live MJPEG stream — mirrors whatever we draw to the LCD, to a browser.
+# Capture-on-demand stays unchanged: the live view is raw, and detection boxes
+# appear on the stream exactly when they appear on the LCD (on capture). No
+# extra inference, so the Pi load is unchanged.
+# ----------------------------------------------------------------------------
+class FrameBus:
+    """Thread-safe holder for the most recent frame to stream (reference only)."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frame = None
+
+    def update(self, frame_bgr):
+        with self._lock:
+            self._frame = frame_bgr
+
+    def get(self):
+        with self._lock:
+            return self._frame
+
+
+_STREAM_INDEX = (
+    b"<!doctype html><title>RustWatch RPi5 Live</title>"
+    b"<body style='margin:0;background:#111;text-align:center'>"
+    b"<img src='/video_feed' style='max-width:100%;height:auto'></body>"
+)
+
+
+def start_stream_server(bus, port, fps, quality):
+    """Start a background MJPEG server (daemon thread). Returns the server."""
+    boundary = "FRAME"
+    frame_interval = 1.0 / max(1, fps)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass  # silence per-request logging
+
+        def do_GET(self):
+            if self.path.rstrip("/") in ("", "/index.html"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(_STREAM_INDEX)
+                return
+            if not self.path.startswith("/video_feed"):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header(
+                "Content-Type",
+                "multipart/x-mixed-replace; boundary=%s" % boundary)
+            self.end_headers()
+            try:
+                while True:
+                    frame = bus.get()
+                    if frame is None:
+                        time.sleep(0.05)
+                        continue
+                    ok, buf = cv2.imencode(
+                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    if not ok:
+                        continue
+                    data = buf.tobytes()
+                    self.wfile.write(("--%s\r\n" % boundary).encode())
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(("Content-Length: %d\r\n\r\n" % len(data)).encode())
+                    self.wfile.write(data)
+                    self.wfile.write(b"\r\n")
+                    time.sleep(frame_interval)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # browser disconnected — normal
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+# ----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
     p.add_argument("--fb", default="/dev/fb1")
@@ -546,12 +629,38 @@ def main():
                         "(0=default/all cores; try 2 on a weak power supply)")
     p.add_argument("--calibrate", action="store_true",
                    help="Run 2-tap touch calibration (with your --flip/--swap flags) and save it")
+    p.add_argument("--no-stream", action="store_true",
+                   help="Disable the live MJPEG web stream")
+    p.add_argument("--stream-port", type=int, default=8000,
+                   help="Port for the live MJPEG web stream (default 8000)")
+    p.add_argument("--stream-fps", type=int, default=15,
+                   help="Max frames/sec sent to the web stream (default 15)")
+    p.add_argument("--stream-quality", type=int, default=70,
+                   help="JPEG quality 1-100 for the web stream (default 70)")
     args = p.parse_args()
 
     if not os.path.exists(args.fb):
         raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run lcd-on first.")
 
-    write_fb, xres, yres = make_fb_writer(args.fb)
+    base_write_fb, xres, yres = make_fb_writer(args.fb)
+
+    # Optional live MJPEG mirror of whatever we draw to the LCD
+    stream_bus = None
+    if not args.no_stream:
+        stream_bus = FrameBus()
+        try:
+            start_stream_server(stream_bus, args.stream_port,
+                                args.stream_fps, args.stream_quality)
+            print(f"Live stream on port {args.stream_port} "
+                  f"→ http://<this-pi-ip>:{args.stream_port}/video_feed")
+        except OSError as e:
+            print(f"Live stream disabled (port {args.stream_port}): {e}")
+            stream_bus = None
+
+    def write_fb(frame_bgr):
+        base_write_fb(frame_bgr)
+        if stream_bus is not None:
+            stream_bus.update(frame_bgr)
 
     touch = None
     if not args.no_touch:
@@ -780,7 +889,7 @@ def main():
                     do_cap = True
 
             if do_cap:
-                frame, boxes, analysis, infer_ms = capture_and_detect(
+                frame, boxes, scores, ids, analysis, infer_ms, blur_score = capture_and_detect(
                     picam2, session, input_name, settings["threshold"], args.rotate)
                 h = frame.shape[0]
                 sev = analysis["severity"]
@@ -800,6 +909,10 @@ def main():
                     path = os.path.join(cd.DETECTIONS_FOLDER, f"{prefix}_{ts}.jpg")
                     cv2.imwrite(path, frame)
                     print(f"Saved {path}")
+                    # Send the saved capture to the website (best-effort; never blocks)
+                    cd.upload_to_website(frame, boxes, scores, ids,
+                                         analysis.get("severity", "NONE"),
+                                         blur_score, infer_ms / 1000.0)
                 state = "review"
                 continue
 
