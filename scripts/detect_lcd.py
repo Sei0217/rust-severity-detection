@@ -414,14 +414,19 @@ def apply_setting(key, side, settings, models, model_idx, reload_model):
 # Gallery (browse saved captures)
 # ----------------------------------------------------------------------------
 def load_gallery():
-    """Return saved capture image paths, newest first (timestamped names sort)."""
+    """Return saved capture image paths, newest first.
+
+    Sort by modification time, not filename — otherwise the prefix dominates
+    ('corrosion_' always sorts ahead of 'capture_'), burying recent no-detection
+    captures below older detected ones regardless of date.
+    """
     try:
         files = [os.path.join(cd.DETECTIONS_FOLDER, f)
                  for f in os.listdir(cd.DETECTIONS_FOLDER)
                  if f.lower().endswith((".jpg", ".jpeg", ".png"))]
     except OSError:
         return []
-    files.sort(reverse=True)
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return files
 
 
