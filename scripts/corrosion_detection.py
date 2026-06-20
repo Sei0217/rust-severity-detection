@@ -17,16 +17,19 @@ except ImportError:
     requests = None
 
 # Configuration
+# Anchor the detections folder to this script's location so saves and the gallery
+# always use the same path, regardless of the working directory it's launched from.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = "../models/best.onnx"
-DETECTIONS_FOLDER = "../detections"
+DETECTIONS_FOLDER = os.path.join(_SCRIPT_DIR, "..", "detections")
 CONFIDENCE_THRESHOLD = 0.75
 INPUT_SIZE = 640
 
 # --- Website upload (RPi5 → Flask site) ---
-# Point this at the PC running the website, on the SAME Wi-Fi/LAN as the Pi.
-# Find that PC's IPv4 address with `ipconfig` (Windows) / `hostname -I` (Linux),
-# e.g. http://192.168.1.50:5000  — or set the RUSTWATCH_SERVER env var to override.
-WEBSITE_URL     = os.environ.get("RUSTWATCH_SERVER", "http://192.168.1.100:5000")
+# Default points at the demo laptop running the website, on the same Wi-Fi/LAN.
+# Override per-session with the RUSTWATCH_SERVER env var if the laptop IP changes.
+# (Find the laptop's IPv4 with `ipconfig` on Windows / `hostname -I` on Linux.)
+WEBSITE_URL     = os.environ.get("RUSTWATCH_SERVER", "http://192.168.1.3:5000")
 UPLOAD_ENDPOINT = WEBSITE_URL.rstrip("/") + "/upload-rpi5"
 UPLOAD_ENABLED  = True   # set False to disable network upload entirely
 UPLOAD_TIMEOUT  = 10     # seconds before giving up on the POST
