@@ -6,6 +6,14 @@ all_rust_conversion/
 detections/
 models/development/
 segmentation/training/
+images/
 runs/
+roboflow/
+Rust-Detection-8/
+approach_b/
 .env
 *.env
+
+# Python bytecode
+__pycache__/
+*.pyc
