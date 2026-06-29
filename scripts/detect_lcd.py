@@ -69,6 +69,7 @@ ABS_Y = 0x01
 BTN_TOUCH = 0x14a
 LONG_PRESS = 0.6          # seconds held = "long press"
 TOUCH_CAL_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_touch.json")
+SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".detect_lcd_settings.json")
 
 SETTINGS_LAYOUT = ["threshold", "model", "auto_save", "show_fps", "gallery", "shutdown"]
 ROW_TOP = 0.18            # rows occupy this fraction..0.98 of the screen height
@@ -701,6 +702,31 @@ def main():
     model_idx = next((i for i, m in enumerate(models)
                       if os.path.abspath(m) == os.path.abspath(cd.MODEL_PATH)), 0)
 
+    # Persisted settings (survive reboots); CLI args are the fallback defaults.
+    settings = {"threshold": args.conf, "auto_save": not args.no_save, "show_fps": False}
+    try:
+        with open(SETTINGS_FILE) as _f:
+            _saved = json.load(_f)
+        for _k in ("threshold", "auto_save", "show_fps"):
+            if _k in _saved:
+                settings[_k] = _saved[_k]
+        if _saved.get("model"):
+            model_idx = next((i for i, p in enumerate(models)
+                              if model_name(p) == _saved["model"]), model_idx)
+        print("Loaded saved settings.")
+    except (OSError, ValueError):
+        pass
+
+    def save_settings():
+        try:
+            with open(SETTINGS_FILE, "w") as _f:
+                json.dump({"threshold": settings["threshold"],
+                           "auto_save": settings["auto_save"],
+                           "show_fps": settings["show_fps"],
+                           "model": model_name(models[model_idx])}, _f)
+        except OSError as e:
+            print(f"Could not save settings: {e}")
+
     def make_session(path):
         so = ort.SessionOptions()
         if args.threads and args.threads > 0:
@@ -721,8 +747,6 @@ def main():
             print(f"Model -> {model_name(path)}")
         except Exception as e:
             print(f"Failed to load {path}: {e}")
-
-    settings = {"threshold": args.conf, "auto_save": not args.no_save, "show_fps": False}
 
     picam2 = Picamera2()
     picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
@@ -805,6 +829,7 @@ def main():
                             shutdown_confirm = True
                             break
                         model_idx = apply_setting(key, side, settings, models, model_idx, reload_model)
+                        save_settings()
                 if state == "settings":
                     if shutdown_confirm:
                         write_fb(draw_confirm(xres, yres, "Shut down the Pi?", "Shutdown"))
