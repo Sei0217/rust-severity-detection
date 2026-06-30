@@ -29,7 +29,7 @@ INPUT_SIZE = 640
 # Default points at the demo laptop running the website, on the same Wi-Fi/LAN.
 # Override per-session with the RUSTWATCH_SERVER env var if the laptop IP changes.
 # (Find the laptop's IPv4 with `ipconfig` on Windows / `hostname -I` on Linux.)
-WEBSITE_URL     = os.environ.get("RUSTWATCH_SERVER", "http://10.194.230.13:5000")
+WEBSITE_URL     = os.environ.get("RUSTWATCH_SERVER", "http://10.151.176.13:5000")
 UPLOAD_ENDPOINT = WEBSITE_URL.rstrip("/") + "/upload-rpi5"
 UPLOAD_ENABLED  = True   # set False to disable network upload entirely
 UPLOAD_TIMEOUT  = 10     # seconds before giving up on the POST
