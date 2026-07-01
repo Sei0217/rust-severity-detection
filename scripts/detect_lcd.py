@@ -100,6 +100,41 @@ def letterbox(img, tw, th):
     return canvas
 
 
+def find_lcd_framebuffer():
+    """Return '/dev/fbN' for the SPI LCD, matched by driver name (not number).
+
+    Framebuffer numbers can swap between boots — the KMS/HDMI driver (vc4drmfb)
+    may grab fb0 and push the SPI panel to fb1 — so a hardcoded number silently
+    writes to the wrong screen. Match the known panel name instead. Returns None
+    if no SPI panel is found (caller falls back to a default).
+    """
+    KNOWN = ("fb_ili9486", "fb_ili9488", "fb_ili9341",
+             "fb_st7789", "fb_st7735", "fb_hx8357d")
+    base = "/sys/class/graphics"
+    try:
+        fbs = sorted(d for d in os.listdir(base) if d.startswith("fb") and d[2:].isdigit())
+    except OSError:
+        return None
+
+    def name_of(fb):
+        try:
+            with open(os.path.join(base, fb, "name")) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    # Prefer an exact known SPI panel name
+    for fb in fbs:
+        if name_of(fb) in KNOWN:
+            return "/dev/" + fb
+    # Otherwise the first framebuffer that isn't the KMS/DRM (HDMI) device
+    for fb in fbs:
+        n = name_of(fb)
+        if n and not n.startswith("vc4") and "drm" not in n.lower():
+            return "/dev/" + fb
+    return None
+
+
 def make_fb_writer(fb_path):
     xres, yres, bpp = get_fb_geometry(fb_path)
     print(f"Framebuffer {fb_path}: {xres}x{yres} @ {bpp}bpp")
@@ -619,7 +654,9 @@ def start_stream_server(bus, port, fps, quality):
 # ----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Capture-on-demand corrosion detection on the SPI LCD.")
-    p.add_argument("--fb", default="/dev/fb1")
+    p.add_argument("--fb", default=None,
+                   help="Framebuffer device (default: auto-detect the SPI LCD by name, "
+                        "else /dev/fb1). Pass e.g. --fb /dev/fb0 to force a specific one.")
     p.add_argument("--conf", type=float, default=cd.CONFIDENCE_THRESHOLD)
     p.add_argument("--no-save", action="store_true")
     p.add_argument("--touch", default=None, help="Touch device (default: auto-detect)")
@@ -644,6 +681,14 @@ def main():
     p.add_argument("--stream-quality", type=int, default=70,
                    help="JPEG quality 1-100 for the web stream (default 70)")
     args = p.parse_args()
+
+    # Auto-detect the SPI LCD framebuffer by name unless the user forced --fb,
+    # since fb0/fb1 can swap between boots (KMS/HDMI may take fb0).
+    if args.fb is None:
+        detected = find_lcd_framebuffer()
+        args.fb = detected or "/dev/fb1"
+        print(f"Framebuffer auto-selected: {args.fb}" +
+              ("" if detected else " (no SPI panel matched — falling back)"))
 
     if not os.path.exists(args.fb):
         raise SystemExit(f"{args.fb} not found — is the LCD overlay loaded? Run lcd-on first.")
